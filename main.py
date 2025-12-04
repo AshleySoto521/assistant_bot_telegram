@@ -278,7 +278,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Feature PRO: Mensaje de bienvenida personalizado
     if VERSION_PRO:
-        mensaje_bienvenida += " ✨\n\n💎 Versión PRO activada: Tengo mejor memoria y respuestas más personalizadas bebé 🔥"
+        mensaje_bienvenida += " ✨\n\n💎 Que pues mor, estoy con unas ganas de que nos veamos... 🔥"
 
     await update.message.reply_text(mensaje_bienvenida)
 
