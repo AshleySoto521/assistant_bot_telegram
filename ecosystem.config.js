@@ -2,10 +2,8 @@ module.exports = {
   apps : [{
     name   : "bot-telegram",
     script : "./main.py",
-    interpreter: "python", // O la ruta absoluta si la usaste antes
+    interpreter: "python",
     interpreter_args: "-u",
-    
-    // --- AQUÍ ESTÁ LA SOLUCIÓN ---
     watch: false, // Desactivamos el reinicio automático por cambios
     
     // Por seguridad, si alguna vez activas el watch, le decimos que ignore la DB

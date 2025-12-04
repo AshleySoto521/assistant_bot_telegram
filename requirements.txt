@@ -1,3 +1,4 @@
 python-telegram-bot[job-queue]
 google-generativeai
 python-dotenv
+pytz
