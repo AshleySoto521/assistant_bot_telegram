@@ -3,6 +3,7 @@ import sqlite3
 import os
 import asyncio
 import re
+import json
 from dotenv import load_dotenv
 from datetime import datetime, time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -100,6 +101,26 @@ def obtener_historial_usuario(user_id, limite=20):
     historial_formateado += "="*50
     return historial_formateado
 
+def limpiar_respuesta_ia(texto):
+    """Elimina texto meta de la IA y deja solo el contenido real del mensaje"""
+    # Patrones comunes de texto meta que la IA puede incluir
+    patrones_a_eliminar = [
+        r'^.*?aquí\s+(tienes|está|va)\s+(el\s+)?mensaje.*?:\s*',
+        r'^.*?perfecto[,.]?\s+',
+        r'^claro[,.]?\s+',
+        r'^.*?voy\s+a\s+(escribir|generar|crear).*?:\s*',
+        r'^.*?mensaje\s+para\s+(tu\s+)?grupo.*?:\s*',
+        r'^.*?para\s+(el\s+)?telegram.*?:\s*',
+    ]
+
+    texto_limpio = texto.strip()
+
+    # Aplicar cada patrón de forma case-insensitive
+    for patron in patrones_a_eliminar:
+        texto_limpio = re.sub(patron, '', texto_limpio, flags=re.IGNORECASE | re.MULTILINE)
+
+    return texto_limpio.strip()
+
 def esta_en_horario_permitido():
     """Verifica si la hora actual está dentro del horario configurado para publicaciones"""
     try:
@@ -137,19 +158,54 @@ async def generar_post_automatico(context: ContextTypes.DEFAULT_TYPE):
         print(f"⏸️ Post automático omitido. Hora actual: {hora_actual} (Horario: {HORA_INICIO_POST}-{HORA_FIN_POST})")
         return
 
-    prompt_base = "Eres una mujer influencer colombiana (de medallo) de 27 años radicando en la CDMX. Genera un mensaje corto, picarón y enganchador para tu audiencia en Telegram. El objetivo es que te escriban por privado. No uses saludos como 'hola chicos', ve directo al grano. Usa emojis."
+    # Crear solicitud en formato JSON para que la IA la entienda mejor
+    solicitud_base = {
+        "tarea": "generar_post_telegram",
+        "personaje": {
+            "nombre": "Fer Ruiz",
+            "edad": 27,
+            "origen": "Medellín, Colombia",
+            "ubicacion_actual": "CDMX, México",
+            "profesion": "influencer, Modelo de contenido para adutos"
+        },
+        "caracteristicas_mensaje": {
+            "longitud": "corto (máximo 2-3 líneas)",
+            "tono": ["coqueto", "picarón", "directo", "paisa"],
+            "objetivo": "generar interacción y mensajes privados",
+            "palabras_clave": ["mor", "bebé", "parce", "obvio"],
+            "emojis_sugeridos": ["🔥", "👀", "😈", "💅", "💋"],
+            "evitar": ["saludos genéricos como 'hola chicos'", "introduciones", "explicaciones meta"]
+        },
+        "instruccion": "Genera SOLO el texto del mensaje que se publicará, sin introducciones ni explicaciones adicionales."
+    }
 
     # Feature PRO: Posts más personalizados y variados
     if VERSION_PRO:
-        prompt = prompt_base + "\n\nVARIANTE PRO: Alterna entre estos estilos: 1) Pregunta provocativa, 2) Historia corta intrigante, 3) Consejo atrevido, 4) Confesión picante. Elige uno al azar y hazlo único."
-    else:
-        prompt = prompt_base
+        solicitud_base["variantes_pro"] = {
+            "estilos_disponibles": [
+                "pregunta_provocativa",
+                "historia_corta_intrigante",
+                "consejo_atrevido",
+                "confesion_picante"
+            ],
+            "instruccion": "Alterna entre los estilos disponibles y hazlo único cada vez"
+        }
+
+    # Convertir la solicitud a JSON y crear el prompt
+    solicitud_json = json.dumps(solicitud_base, ensure_ascii=False, indent=2)
+    prompt = f"""Recibiste la siguiente solicitud en formato JSON para mejor comprensión:
+
+{solicitud_json}
+
+Basándote en esta solicitud estructurada, genera el mensaje solicitado. Responde ÚNICAMENTE con el texto del mensaje, nada más."""
 
     try:
         response = model.generate_content(prompt)
         mensaje_ia = response.text
 
-        mensaje_final = f"\n\n{mensaje_ia}"
+        # Limpiar respuesta de la IA para eliminar texto meta
+        mensaje_limpio = limpiar_respuesta_ia(mensaje_ia)
+        mensaje_final = f"\n\n{mensaje_limpio}"
 
         keyboard = [[InlineKeyboardButton("🔥 Escríbeme por privado", url=f"https://t.me/{context.bot.username}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
