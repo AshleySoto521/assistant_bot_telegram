@@ -28,7 +28,7 @@ if not TOKEN_TELEGRAM or not GOOGLE_API_KEY:
 # ========================================================
 
 genai.configure(api_key=GOOGLE_API_KEY)
-# Usamos el modelo más rápido y nuevo disponible en tu cuenta
+# Usamos el modelo más rápido que solicitaste, o usa 'gemini-1.5-flash' para evitar límites del plan gratuito.
 model = genai.GenerativeModel('gemini-2.5-flash')
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -91,7 +91,7 @@ async def generar_post_automatico(context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ Error en el post automático: {e}")
 
 # ==============================================================================
-#  EL CEREBRO INTELIGENTE (IA CLASIFICADORA)
+#  EL CEREBRO INTELIGENTE (IA CLASIFICADORA Y PERSONALIDAD)
 # ==============================================================================
 
 async def manejar_mensaje_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,8 +126,31 @@ async def manejar_mensaje_usuario(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("¡Uff, mi amor! 👀 Te paso toda la info para tratarte como te mereces:")
             await context.bot.send_message(chat_id=ID_ADMIN, text=f"🚨 **LEAD CALIENTE (IA)** 🚨\nUsuario: {nombre} ({user_id})\nIntención Detectada: Negocios\nDijo: {texto}")
         else:
-            # MODO CHAT (Personalidad Paisa)
-            prompt_respuesta = f"Eres una influencer colombiana paisa, coqueta y divertida. El usuario dice: '{texto}'. Respóndele breve (max 2 frases), usa emojis, trátalo de 'mor' o 'bebé'. No vendas nada, solo socializa."
+            # MODO CHAT (Personalidad Paisa REFORZADA con Few-Shot)
+            prompt_respuesta = f"""
+            Instrucciones de Personalidad:
+            Eres "Fer Ruiz", una influencer colombiana (paisa) de 27 años viviendo en CDMX.
+            - Tu tono es: Coqueta, picaróna, relajada y muy "de barrio" pero fresa.
+            - Palabras obligatorias: Mor, bebé, parce, nea, qué más pues, obvio bobis.
+            - NUNCA respondas como robot ("Soy una IA", "En qué puedo ayudarte").
+            - Si te saludan, no digas "Hola". Di algo como: "Quiubo mor", "Hola bebé".
+            - Usa emojis en cada mensaje: 🔥, 😈, 👀, 💅.
+            - Tus respuestas deben ser CORTAS (máximo 2 líneas).
+            
+            Ejemplos de cómo respondes (Copia este estilo):
+            User: ¿Qué haces?
+            Tú: Aquí pensando en cuándo me vas a invitar a salir mor 💅
+            
+            User: Eres un robot?
+            Tú: Obvio no bobis, soy tu tormento 😈
+            
+            User: Te ves bien
+            Tú: Yo sé que te encanto parce, no lo niegues 💅🔥
+            
+            AHORA RESPONDE AL USUARIO:
+            User: "{texto}"
+            Tú:
+            """
             response = model.generate_content(prompt_respuesta)
             await update.message.reply_text(response.text)
             guardar_mensaje(user_id, response.text, "salida_ia")
@@ -179,7 +202,7 @@ async def cerrar_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_modo_usuario(id_usuario, "ia") # <--- AQUÍ SE RESETEA EL MODO
         
         await update.message.reply_text(f"✅ Ticket cerrado. El usuario {id_usuario} regresa con la IA.")
-        await context.bot.send_message(chat_id=id_usuario, text="Cualquier duda no dudes en avisarme mor. 👋")
+        await context.bot.send_message(chat_id=id_usuario, text="Cualquier cosa no dudes en avisarme mor. 👋")
     else:
         await update.message.reply_text("❌ No encontré el ID para cerrar el ticket.")
 
@@ -233,7 +256,7 @@ def main():
     job_queue = app.job_queue
     job_queue.run_repeating(generar_post_automatico, interval=14400, first=30)
     
-    print("🤖 Bot Paisa 3.0 Iniciado (Gemini 2.5 Flash)...")
+    print("🤖 Bot Paisa 3.1 Iniciado (Personalidad Fuerte)...")
     app.run_polling()
 
 if __name__ == '__main__':
