@@ -10,6 +10,13 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
 import pytz
+import sys
+
+# ================= FIX UTF-8 PARA WINDOWS + PM2 =================
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+# ================================================================
 
 # ================= CONFIGURACIÓN SEGURA =================
 load_dotenv() # Carga las claves del archivo .env
