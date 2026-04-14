@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 from datetime import datetime, time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import pytz
 import sys
 
@@ -44,9 +45,23 @@ if not TOKEN_TELEGRAM or not GOOGLE_API_KEY:
     exit()
 # ========================================================
 
-genai.configure(api_key=GOOGLE_API_KEY)
-# Usamos el modelo más rápido que solicitaste, o usa 'gemini-1.5-flash' para evitar límites del plan gratuito.
-model = genai.GenerativeModel('gemini-2.5-flash')
+client = genai.Client(api_key=GOOGLE_API_KEY)
+MODELO_IA = 'gemini-2.0-flash'
+SAFETY_SETTINGS = [
+    types.SafetySetting(category='HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold='BLOCK_NONE'),
+    types.SafetySetting(category='HARM_CATEGORY_HARASSMENT', threshold='BLOCK_NONE'),
+    types.SafetySetting(category='HARM_CATEGORY_HATE_SPEECH', threshold='BLOCK_NONE'),
+    types.SafetySetting(category='HARM_CATEGORY_DANGEROUS_CONTENT', threshold='BLOCK_NONE'),
+]
+
+def generar_contenido(prompt):
+    """Wrapper para llamar a la IA con configuración de seguridad"""
+    response = client.models.generate_content(
+        model=MODELO_IA,
+        contents=prompt,
+        config=types.GenerateContentConfig(safety_settings=SAFETY_SETTINGS)
+    )
+    return response.text
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -54,8 +69,13 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 def iniciar_db():
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS usuarios (user_id INTEGER PRIMARY KEY, modo TEXT, nombre TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS usuarios (user_id INTEGER PRIMARY KEY, modo TEXT, nombre TEXT, thread_msg_id INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS mensajes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, texto TEXT, fecha TEXT, tipo TEXT)''')
+    # Migración: agregar thread_msg_id si no existe (para DBs existentes)
+    try:
+        c.execute("ALTER TABLE usuarios ADD COLUMN thread_msg_id INTEGER")
+    except sqlite3.OperationalError:
+        pass  # La columna ya existe
     conn.commit()
     conn.close()
 
@@ -68,12 +88,21 @@ def guardar_mensaje(user_id, texto, tipo):
     conn.commit()
     conn.close()
 
-def set_modo_usuario(user_id, modo, nombre="Usuario"):
+def set_modo_usuario(user_id, modo, nombre="Usuario", thread_msg_id=None):
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO usuarios (user_id, modo, nombre) VALUES (?, ?, ?)", (user_id, modo, nombre))
+    c.execute("INSERT OR REPLACE INTO usuarios (user_id, modo, nombre, thread_msg_id) VALUES (?, ?, ?, ?)", (user_id, modo, nombre, thread_msg_id))
     conn.commit()
     conn.close()
+
+def get_thread_msg_id(user_id):
+    """Obtiene el message_id del hilo de conversación del lead"""
+    conn = sqlite3.connect('historial_chat.db')
+    c = conn.cursor()
+    c.execute("SELECT thread_msg_id FROM usuarios WHERE user_id=?", (user_id,))
+    res = c.fetchone()
+    conn.close()
+    return res[0] if res and res[0] else None
 
 def get_modo_usuario(user_id):
     conn = sqlite3.connect('historial_chat.db')
@@ -207,8 +236,7 @@ async def generar_post_automatico(context: ContextTypes.DEFAULT_TYPE):
 Basándote en esta solicitud estructurada, genera el mensaje solicitado. Responde ÚNICAMENTE con el texto del mensaje, nada más."""
 
     try:
-        response = model.generate_content(prompt)
-        mensaje_ia = response.text
+        mensaje_ia = generar_contenido(prompt)
 
         # Limpiar respuesta de la IA para eliminar texto meta
         mensaje_limpio = limpiar_respuesta_ia(mensaje_ia)
@@ -235,95 +263,101 @@ async def manejar_mensaje_usuario(update: Update, context: ContextTypes.DEFAULT_
     
     guardar_mensaje(user_id, texto, "entrada_usuario")
     
-    # Si ya está en modo humano, te reenvía todo directo
+    # Si ya está en modo humano, reenvía al hilo del lead
     modo = get_modo_usuario(user_id)
     if modo == "humano":
-        await context.bot.send_message(chat_id=ID_ADMIN, text=f"📩 Mensaje de {nombre} ({user_id}):\n\n{texto}")
+        thread_id = get_thread_msg_id(user_id)
+        await context.bot.send_message(
+            chat_id=ID_ADMIN,
+            text=f"💬 {nombre} ({user_id}):\n{texto}",
+            reply_to_message_id=thread_id
+        )
         return
 
-    # --- CLASIFICACIÓN CON IA ---
+    # --- CLASIFICACIÓN + RESPUESTA EN UNA SOLA LLAMADA ---
     try:
-        prompt_clasificacion = f"""
-        Actúa como un filtro de seguridad. Analiza el mensaje: "{texto}".
-        - Si quiere comprar, saber precios, contratar, colaborar: Responde VENTA
-        - Si es un saludo, broma, charla casual: Responde CHAT
-        Responde solo una palabra.
-        """
-        
-        clasificacion = model.generate_content(prompt_clasificacion).text.strip().upper()
-        print(f"🧠 IA Analiza: '{texto}' -> {clasificacion}")
+        prompt_base = f"""Eres "Fer Ruiz", una influencer colombiana (paisa) de 27 años viviendo en CDMX.
+Tu tono es: Coqueta, picaróna, relajada y muy "de barrio" pero fresa.
+Palabras obligatorias: Mor, bebé, parce, nea, qué más pues, obvio bobis.
+NUNCA respondas como robot ("Soy una IA", "En qué puedo ayudarte").
+Si te saludan, no digas "Hola". Di algo como: "Quiubo mor", "Hola bebé".
+Usa emojis en cada mensaje: 🔥, 😈, 👀, 💅.
+Tus respuestas deben ser CORTAS (máximo 2 líneas).
 
-        if "VENTA" in clasificacion:
+Ejemplos de cómo respondes:
+User: ¿Qué haces?
+Tú: Aquí pensando en cuándo me vas a invitar a salir mor 💅
+
+User: Eres un robot?
+Tú: Obvio no bobis, soy tu tormento 😈
+
+User: Te ves bien
+Tú: Yo sé que te encanto parce, no lo niegues 💅🔥
+
+REGLA IMPORTANTE DE CLASIFICACIÓN:
+Analiza el mensaje del usuario. Si detectas intención de COMPRA, PRECIOS, CONTRATAR o COLABORAR, tu respuesta DEBE empezar EXACTAMENTE con "[VENTA]" seguido de un mensaje coqueto relacionado.
+Si es charla casual, saludo o broma, responde normal SIN ninguna etiqueta.
+
+Ejemplos de clasificación:
+User: "Cuánto cobras?"
+Tú: [VENTA] Uff mi amor, te paso toda la info para tratarte como mereces 👀🔥
+
+User: "Quiero comprar contenido"
+Tú: [VENTA] Ay bebé, obvio que sí, déjame te cuento todo mor 💅
+
+User: "Hola bb"
+Tú: Quiubo mor, qué más pues 😈🔥"""
+
+        # Feature PRO: Memoria conversacional
+        if VERSION_PRO:
+            conn = sqlite3.connect('historial_chat.db')
+            c = conn.cursor()
+            c.execute("""
+                SELECT texto, tipo FROM mensajes
+                WHERE user_id=?
+                ORDER BY fecha DESC
+                LIMIT 5
+            """, (user_id,))
+            mensajes_recientes = c.fetchall()
+            conn.close()
+
+            contexto_previo = "\n\nCONTEXTO DE LA CONVERSACIÓN RECIENTE:\n"
+            for msg, tipo in reversed(mensajes_recientes):
+                rol = "Usuario" if tipo == "entrada_usuario" else "Tú"
+                contexto_previo += f"{rol}: {msg}\n"
+
+            prompt_final = prompt_base + contexto_previo + f"\n\nAHORA RESPONDE (considera el contexto):\nUser: \"{texto}\"\nTú:"
+        else:
+            prompt_final = prompt_base + f"\n\nAHORA RESPONDE:\nUser: \"{texto}\"\nTú:"
+
+        respuesta_ia = generar_contenido(prompt_final).strip()
+        print(f"🧠 IA Responde a '{texto}' -> {respuesta_ia[:80]}...")
+
+        # Detectar si la IA clasificó como VENTA
+        if respuesta_ia.startswith("[VENTA]"):
+            mensaje_usuario = respuesta_ia.replace("[VENTA]", "").strip()
+            await update.message.reply_text(mensaje_usuario)
+            guardar_mensaje(user_id, mensaje_usuario, "salida_ia")
+
             # ACTIVAR MODO HUMANO
-            set_modo_usuario(user_id, "humano", nombre)
-            await update.message.reply_text("¡Uff, mi amor! 👀 Te paso toda la info para tratarte como te mereces:")
+            notificacion = f"🚨 LEAD CALIENTE (IA) 🚨\nUsuario: {nombre} ({user_id})\nIntención Detectada: Negocios\nMensaje que activó lead: {texto}"
+            msg_notificacion = await context.bot.send_message(chat_id=ID_ADMIN, text=notificacion)
+            set_modo_usuario(user_id, "humano", nombre, thread_msg_id=msg_notificacion.message_id)
 
-            # Preparar notificación para el admin
-            notificacion = f"🚨 **LEAD CALIENTE (IA)** 🚨\nUsuario: {nombre} ({user_id})\nIntención Detectada: Negocios\nMensaje que activó lead: {texto}"
-
-            # Enviar notificación inicial
-            await context.bot.send_message(chat_id=ID_ADMIN, text=notificacion)
-
-            # Enviar historial de conversación para dar contexto
+            # Enviar historial como respuesta al hilo del lead
             historial = obtener_historial_usuario(user_id, limite=20)
-            if historial and len(historial) > 100:  # Solo si hay historial significativo
-                # Dividir historial en chunks si es muy largo (límite de Telegram: 4096 caracteres)
+            if historial and len(historial) > 100:
                 max_length = 4000
                 if len(historial) > max_length:
                     chunks = [historial[i:i+max_length] for i in range(0, len(historial), max_length)]
                     for i, chunk in enumerate(chunks):
-                        await context.bot.send_message(chat_id=ID_ADMIN, text=f"📋 Contexto (parte {i+1}/{len(chunks)}):\n{chunk}")
+                        await context.bot.send_message(chat_id=ID_ADMIN, text=f"📋 Contexto (parte {i+1}/{len(chunks)}):\n{chunk}", reply_to_message_id=msg_notificacion.message_id)
                 else:
-                    await context.bot.send_message(chat_id=ID_ADMIN, text=historial)
+                    await context.bot.send_message(chat_id=ID_ADMIN, text=historial, reply_to_message_id=msg_notificacion.message_id)
         else:
-            # MODO CHAT (Personalidad Paisa REFORZADA con Few-Shot)
-            prompt_base = """
-            Instrucciones de Personalidad:
-            Eres "Fer Ruiz", una influencer colombiana (paisa) de 27 años viviendo en CDMX.
-            - Tu tono es: Coqueta, picaróna, relajada y muy "de barrio" pero fresa.
-            - Palabras obligatorias: Mor, bebé, parce, nea, qué más pues, obvio bobis.
-            - NUNCA respondas como robot ("Soy una IA", "En qué puedo ayudarte").
-            - Si te saludan, no digas "Hola". Di algo como: "Quiubo mor", "Hola bebé".
-            - Usa emojis en cada mensaje: 🔥, 😈, 👀, 💅.
-            - Tus respuestas deben ser CORTAS (máximo 2 líneas).
-
-            Ejemplos de cómo respondes (Copia este estilo):
-            User: ¿Qué haces?
-            Tú: Aquí pensando en cuándo me vas a invitar a salir mor 💅
-
-            User: Eres un robot?
-            Tú: Obvio no bobis, soy tu tormento 😈
-
-            User: Te ves bien
-            Tú: Yo sé que te encanto parce, no lo niegues 💅🔥
-            """
-
-            # Feature PRO: Memoria conversacional (considera mensajes anteriores)
-            if VERSION_PRO:
-                # Obtener últimos 5 mensajes para contexto
-                conn = sqlite3.connect('historial_chat.db')
-                c = conn.cursor()
-                c.execute("""
-                    SELECT texto, tipo FROM mensajes
-                    WHERE user_id=?
-                    ORDER BY fecha DESC
-                    LIMIT 5
-                """, (user_id,))
-                mensajes_recientes = c.fetchall()
-                conn.close()
-
-                contexto_previo = "\n\nCONTEXTO DE LA CONVERSACIÓN RECIENTE:\n"
-                for msg, tipo in reversed(mensajes_recientes):
-                    rol = "Usuario" if tipo == "entrada_usuario" else "Tú"
-                    contexto_previo += f"{rol}: {msg}\n"
-
-                prompt_respuesta = prompt_base + contexto_previo + f"\n\nAHORA RESPONDE AL USUARIO (considera el contexto):\nUser: \"{texto}\"\nTú:"
-            else:
-                prompt_respuesta = prompt_base + f"\n\nAHORA RESPONDE AL USUARIO:\nUser: \"{texto}\"\nTú:"
-
-            response = model.generate_content(prompt_respuesta)
-            await update.message.reply_text(response.text)
-            guardar_mensaje(user_id, response.text, "salida_ia")
+            # MODO CHAT normal
+            await update.message.reply_text(respuesta_ia)
+            guardar_mensaje(user_id, respuesta_ia, "salida_ia")
 
     except Exception as e:
         print(f"Error IA: {e}")
@@ -348,20 +382,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_responde_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message: return
 
+    # Buscar el ID del usuario en toda la cadena de respuestas
     texto_original = update.message.reply_to_message.text or ""
-    # Busca ID en formato (123456)
     match = re.search(r'\((\d{5,})\)', texto_original)
 
     if match:
         try:
             id_usuario_destino = int(match.group(1))
             await context.bot.send_message(chat_id=id_usuario_destino, text=update.message.text)
-            await update.message.reply_text(f"✅ Enviado al usuario {id_usuario_destino}.")
+
+            # Confirmar y agrupar en el hilo del lead
+            thread_id = get_thread_msg_id(id_usuario_destino)
+            await context.bot.send_message(
+                chat_id=ID_ADMIN,
+                text=f"✅ Tú respondiste:\n{update.message.text}",
+                reply_to_message_id=thread_id
+            )
             guardar_mensaje(id_usuario_destino, update.message.text, "salida_humano")
         except Exception as e:
             await update.message.reply_text(f"❌ Error al enviar: {e}")
     else:
-        await update.message.reply_text("⚠️ No encontré el ID. Asegúrate de responder a un mensaje del bot que tenga el ID entre paréntesis.")
+        await update.message.reply_text("⚠️ No encontré el ID. Responde a un mensaje del bot que tenga el ID entre paréntesis.")
 
 async def cerrar_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /cerrar para devolver al usuario a la IA"""
@@ -383,13 +424,17 @@ async def cerrar_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ No encontré el ID para cerrar el ticket.")
 
-async def publicar_foto_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    texto_foto = update.message.caption if update.message.caption else ""
+async def publicar_media_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Publica fotos o videos del admin al grupo"""
+    texto_caption = update.message.caption if update.message.caption else ""
     keyboard = [[InlineKeyboardButton("🔥 Escribeme al privado mor", url=f"https://t.me/{context.bot.username}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
+
+    tipo = "Video" if update.message.video else "Foto"
+
     try:
-        await context.bot.copy_message(chat_id=ID_TU_GRUPO, from_chat_id=ID_ADMIN, message_id=update.message.message_id, caption=texto_foto, reply_markup=reply_markup)
-        await update.message.reply_text("✅ Foto publicada.")
+        await context.bot.copy_message(chat_id=ID_TU_GRUPO, from_chat_id=ID_ADMIN, message_id=update.message.message_id, caption=texto_caption, reply_markup=reply_markup)
+        await update.message.reply_text(f"✅ {tipo} publicado/a en el grupo.")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
@@ -437,6 +482,80 @@ async def ver_historial_usuario(update: Update, context: ContextTypes.DEFAULT_TY
 
     except ValueError:
         await update.message.reply_text("❌ El ID debe ser un número válido")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def ver_leads_activos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /leads para ver todos los leads activos (solo admin)"""
+    if update.effective_user.id != ID_ADMIN:
+        return
+
+    try:
+        conn = sqlite3.connect('historial_chat.db')
+        c = conn.cursor()
+        c.execute("""
+            SELECT u.nombre, u.user_id, MAX(m.fecha) as ultimo_msg
+            FROM usuarios u
+            LEFT JOIN mensajes m ON u.user_id = m.user_id
+            WHERE u.modo='humano'
+            GROUP BY u.user_id
+            ORDER BY ultimo_msg DESC
+        """)
+        leads = c.fetchall()
+        conn.close()
+
+        if not leads:
+            await update.message.reply_text("✅ No hay leads activos en este momento.")
+            return
+
+        texto = f"🔥 LEADS ACTIVOS ({len(leads)})\n{'='*40}\n\n"
+        for i, (nombre, uid, ultimo_msg) in enumerate(leads, 1):
+            fecha = ultimo_msg if ultimo_msg else "Sin mensajes"
+            texto += f"{i}. {nombre} ({uid})\n   📅 Último msg: {fecha}\n\n"
+
+        texto += f"{'='*40}\n💡 Usa /cerrar (reply) para cerrar uno\n💡 Usa /cerrartodos para cerrar todos"
+        await update.message.reply_text(texto)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def cerrar_todos_leads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /cerrartodos para cerrar todos los leads activos de una vez"""
+    if update.effective_user.id != ID_ADMIN:
+        return
+
+    try:
+        conn = sqlite3.connect('historial_chat.db')
+        c = conn.cursor()
+        c.execute("SELECT user_id, nombre FROM usuarios WHERE modo='humano'")
+        leads = c.fetchall()
+
+        if not leads:
+            conn.close()
+            await update.message.reply_text("✅ No hay leads activos para cerrar.")
+            return
+
+        c.execute("UPDATE usuarios SET modo='ia' WHERE modo='humano'")
+        conn.commit()
+        conn.close()
+
+        # Notificar a cada usuario
+        errores = 0
+        for user_id, nombre in leads:
+            try:
+                await context.bot.send_message(chat_id=user_id, text="Cualquier cosa no dudes en avisarme mor. 👋")
+            except Exception:
+                errores += 1
+
+        resumen = f"✅ {len(leads)} lead(s) cerrado(s):\n\n"
+        for user_id, nombre in leads:
+            resumen += f"• {nombre} ({user_id})\n"
+
+        if errores:
+            resumen += f"\n⚠️ {errores} usuario(s) no pudieron ser notificados."
+
+        await update.message.reply_text(resumen)
+
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
@@ -503,10 +622,12 @@ def main():
     app.add_handler(CommandHandler("post", postear_texto_grupo))
     app.add_handler(CommandHandler("cerrar", cerrar_ticket))
     app.add_handler(CommandHandler("stats", ver_estadisticas))
+    app.add_handler(CommandHandler("leads", ver_leads_activos))
+    app.add_handler(CommandHandler("cerrartodos", cerrar_todos_leads))
     app.add_handler(CommandHandler("historial", ver_historial_usuario))
 
     # 2. Multimedia y Admin (Ignoran comandos)
-    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE & filters.User(ID_ADMIN), publicar_foto_admin))
+    app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO) & filters.ChatType.PRIVATE & filters.User(ID_ADMIN), publicar_media_admin))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE & filters.User(ID_ADMIN), admin_responde_texto))
 
     # 3. Usuarios Generales (IA) - Siempre al final
