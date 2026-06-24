@@ -1,112 +1,174 @@
-# 🤖 Telegram Influencer AI Bot (Smart Handoff 4.0 PRO)
+# 🤖 Bot Paisa — Buzón Unificado de Leads (v4.0 · Modo Privado Directo)
 
-Este es un bot de Telegram avanzado diseñado para influencers y marcas personales. A diferencia de los bots tradicionales, este utiliza **Inteligencia Artificial (Gemini 2.5 Flash)** para "leer la mente" del usuario: distingue automáticamente entre una charla casual y una oportunidad de negocio.
+Bot de Telegram para creadores de contenido / marcas personales que funciona como un **buzón unificado anónimo**: capta gente desde tu grupo con publicaciones automáticas, redirige todas las conversaciones privadas hacia tu chat personal organizadas por hilos, y te deja responder a cada persona sin que sepan que hay un bot de por medio.
 
-El sistema opera bajo la arquitectura **"Human-in-the-Loop"**: La IA entretiene a la audiencia, pero cuando detecta dinero (intención de compra), le pasa el control al humano.
+> **Sin IA.** Esta versión **no** usa modelos de lenguaje. Cada mensaje del usuario llega directo a ti (el admin) y tú respondes manualmente. Es simple, predecible y de **costo 0** (Telegram + SQLite local + hosting en tu PC).
 
-**Coste de Operación:** 0€ (Usando Free Tier de Google y Hosting Local).
+---
 
-## 🆕 Novedades Versión 4.0
+## 🧭 ¿Cómo funciona? (arquitectura)
 
-- ⏰ **Horarios Inteligentes**: Configura horarios específicos para publicaciones automáticas
-- 📜 **Historial Contextual**: Envío automático del historial de conversación cuando se detecta un lead
-- 💎 **Modo PRO Gratuito**: Features adicionales sin costo (memoria conversacional, posts variados)
-- 📊 **Estadísticas Avanzadas**: Comando `/stats` para ver métricas del bot
-- 🔍 **Ver Historial**: Comando `/historial [user_id]` para revisar conversaciones
-
-## ✨ Características Principales
-
-* **🧠 Cerebro Clasificador (Smart Filter):** Ya no usa listas de palabras tontas. La IA analiza el contexto de cada mensaje.
-    * *Ejemplo:* "Tu ropa es linda" -> **IA Responde** (Chat).
-    * *Ejemplo:* "Quiero comprar esa ropa" -> **Te avisa a ti** (Venta).
-* **🎟️ Sistema de Tickets (/cerrar):** Cuando terminas de atender a un cliente humano, usas un comando para que la IA vuelva a tomar el control de ese usuario automáticamente.
-* **📢 Megáfono (/post):** Comando administrativo para enviar anuncios de texto directamente al canal/grupo desde el chat privado del bot.
-* **📸 Modo Espejo (Fotos):** Si envías una foto al bot por privado, él la "repostea" en el grupo añadiendo botones de contacto (Call to Action).
-* **⏰ Publicador Automático:** Genera temas de conversación picantes/interesantes mediante IA y los publica en el grupo cada 4 horas para mantener el engagement.
-* **📂 Base de Datos Local:** Gestión de historial y estados de usuario mediante SQLite (100% privado y sin servidores).
-
-## 🛠️ Requisitos Técnicos
-
-* Python 3.10 o superior.
-* Una cuenta de Google AI Studio (API Key de Gemini).
-* Un Bot de Telegram (creado con @BotFather).
-
-## 📦 Instalación y Dependencias
-
-1.  **Clonar/Descargar el proyecto** en tu equipo local.
-2.  **Instalar dependencias:**
-    Abre tu terminal en la carpeta del proyecto y ejecuta:
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *Contenido del requirements.txt:*
-    ```text
-    python-telegram-bot[job-queue]
-    google-generativeai
-    python-dotenv
-    ```
-
-## ⚙️ Configuración (.env)
-
-El proyecto utiliza un archivo de seguridad. Crea un archivo llamado `.env` en la raíz del proyecto y configura tus claves:
-
-```env
-# Configuración básica
-TOKEN_TELEGRAM=tu_token_aqui
-GOOGLE_API_KEY=tu_api_key_de_google
-ID_TU_GRUPO=-100xxxxxxxxxx  # ID del grupo (incluir el signo menos)
-ID_ADMIN=123456789          # Tu ID personal para permisos admin
-
-# Configuración de horarios (NUEVO en v4.0)
-HORA_INICIO_POST=09:00      # Hora inicio publicaciones automáticas
-HORA_FIN_POST=21:00         # Hora fin publicaciones automáticas
-TIMEZONE=America/Mexico_City # Zona horaria
-
-# Versión PRO - 100% GRATIS (NUEVO en v4.0)
-VERSION_PRO=true            # true para activar features PRO sin costo
+```
+Usuario (privado)  ──►  BOT  ──►  Tu chat de Admin (hilos por persona)
+        ▲                                   │
+        └───────────  BOT  ◄────────────────┘   (tú respondes; el bot reenvía)
 ```
 
-## 🎮 Comandos Disponibles
+1. Un usuario le escribe al bot por privado (texto, foto, video, voz o audio).
+2. El bot **guarda** el mensaje en SQLite y crea (o reutiliza) un **hilo** en tu chat: un mensaje "ancla" con `👤 Nombre (ID)`.
+3. Reenvía el contenido a tu chat como **respuesta** a ese hilo, para que todo quede ordenado por persona.
+4. Tú **respondes** haciendo *Reply* a cualquier mensaje que tenga el `(ID)` entre paréntesis; el bot extrae ese ID y le hace llegar tu respuesta al usuario.
+5. El usuario nunca sabe que hubo un intermediario: ve un chat normal contigo.
 
-### Comandos para Usuarios
-- `/start` - Inicia la conversación con el bot
+### Estados de un lead (`modo`)
+- **`nuevo`** — aún no registrado / sin hilo.
+- **`humano`** — conversación activa, hilo abierto en tu chat.
+- **`cerrado`** — ticket cerrado (sigue en la base para promos y reapertura).
 
-### Comandos de Administrador
+---
 
-**Comandos Básicos:**
-- `/post [mensaje]` - Publica un mensaje en el grupo con botón de contacto
-- `/cerrar` - Cierra un ticket y devuelve el usuario a la IA (responder al mensaje del usuario)
+## ✨ Funcionalidades
 
-**Comandos Nuevos v4.0:**
-- `/stats` - Ver estadísticas completas del bot (usuarios, leads, mensajes, configuración)
-- `/historial [user_id]` - Ver el historial de conversación de un usuario específico
+### Para el usuario
+- **`/start`** — saludo de bienvenida.
+- Puede enviar **texto y multimedia** (foto, video, nota de voz, audio); todo se reenvía a tu hilo.
+- Al escribir por primera vez recibe una respuesta automática ("ya te leo, te respondo en un momentico").
 
-### Funciones Automáticas
+### Para ti (admin)
+- **Responder por *Reply*** — respondes a un mensaje con `(ID)` y el bot reenvía tu texto o multimedia **solo a ese usuario**.
+- **Publicar multimedia al grupo** — si envías una foto/video al bot **sin** responder a nadie, lo publica en el grupo con un botón de *Call To Action*.
+- **Hilos ordenados** — cada persona tiene su propio hilo; al abrir un lead nuevo recibes su historial automáticamente.
 
-**Publicaciones con Horario:**
-- Las publicaciones automáticas solo se ejecutan dentro del horario configurado
-- Si se intenta publicar fuera de horario, se omite automáticamente
-- Perfecto para no molestar a tu audiencia de madrugada
+### Automatizaciones
+- **📢 Publicaciones automáticas** — cada **6 horas**, dentro del horario permitido, el bot publica en el grupo un mensaje "gancho" aleatorio con un botón **"Escríbeme por privado"**.
+- **🔁 Seguimiento de leads fríos** — cada hora revisa los leads activos: si tú respondiste y el usuario lleva **6 horas en silencio**, le envía **un** mensaje de reenganche (una sola vez, hasta que vuelva a escribir). Solo dentro del horario permitido, y te avisa en el hilo cuando lo hace.
+- **⏰ Control de horario** — todas las publicaciones y seguimientos respetan la franja `HORA_INICIO_POST`–`HORA_FIN_POST` para no escribir de madrugada.
 
-**Detección de Leads:**
-- Cuando la IA detecta intención de compra/negocio:
-  1. Notifica al admin con el mensaje que activó el lead
-  2. Envía automáticamente el historial completo de la conversación
-  3. Cambia el usuario a modo "humano" para que respondas personalmente
+---
 
-## 💎 Diferencias entre Versión FREE y PRO
+## 🎮 Comandos
 
-| Feature | FREE | PRO |
-|---------|------|-----|
-| Detección de leads con IA | ✅ | ✅ |
-| Publicaciones automáticas | ✅ | ✅ |
-| Control de horarios | ✅ | ✅ |
-| Envío de historial en leads | ✅ | ✅ |
-| Comandos admin (stats, historial) | ✅ | ✅ |
-| Memoria conversacional (contexto) | ❌ | ✅ |
-| Posts variados y creativos | ❌ | ✅ |
-| Análisis mejorado de leads | ❌ | ✅ |
-| Personalización avanzada | ❌ | ✅ |
-| **Costo** | **GRATIS** | **GRATIS** |
+### Usuario
+| Comando | Descripción |
+|---|---|
+| `/start` | Inicia la conversación con el bot |
 
-**Nota:** Ambas versiones son 100% gratuitas. La versión PRO simplemente activa features adicionales del modelo de IA sin costos extra.
+### Administrador (solo tu `ID_ADMIN`)
+| Comando | Descripción |
+|---|---|
+| `/post <texto>` | Publica un mensaje al grupo con botón de contacto |
+| `/promo <texto>` | Envía una promo a **todos** los leads (activos + cerrados) |
+| `/leads` | Lista los leads activos |
+| `/stats` | Estadísticas: usuarios, leads, mensajes y últimos activos |
+| `/historial <id>` | Muestra el historial de conversación de un usuario |
+| `/abrir <id>` | Reabre y trae arriba el hilo de un lead |
+| `/cerrar` | Cierra el ticket del lead (respondiendo a su mensaje) |
+| `/cerrarid <id>` | Cierra un ticket por ID, sin necesidad de *Reply* |
+| `/cerrartodos` | Cierra todos los leads activos de golpe |
+
+> El **menú `/`** de Telegram se configura solo al arrancar: tú ves todos los comandos de admin; los usuarios normales solo ven `/start`.
+
+---
+
+## 🗄️ Base de datos (SQLite local — `historial_chat.db`)
+
+**Tabla `usuarios`**
+| Columna | Descripción |
+|---|---|
+| `user_id` | ID de Telegram del usuario (clave primaria) |
+| `modo` | Estado: `nuevo` / `humano` / `cerrado` |
+| `nombre` | Nombre del usuario |
+| `thread_msg_id` | ID del mensaje "ancla" del hilo en tu chat |
+| `seguimiento_enviado` | 1 si ya se le envió el reenganche por silencio (evita repetir) |
+
+**Tabla `mensajes`**
+| Columna | Descripción |
+|---|---|
+| `id` | Autoincremental |
+| `user_id` | A qué usuario pertenece |
+| `texto` | Contenido (o `[MEDIA]` / `[PROMO] ...`) |
+| `fecha` | Marca de tiempo |
+| `tipo` | `entrada_usuario` (lo que escribe él/ella) o `salida_humano` (lo que envías tú) |
+
+La estructura se crea/migra sola al iniciar (`iniciar_db()`), así que no hay que hacer nada manual.
+
+---
+
+## 🛠️ Requisitos
+
+- **Python 3.10+**
+- Un **bot de Telegram** creado con [@BotFather](https://t.me/BotFather)
+- Tu **ID de Telegram** y el **ID del grupo** (puedes obtenerlos con `detector_ids.py` o [@userinfobot](https://t.me/userinfobot))
+
+## 📦 Instalación
+
+```bash
+pip install -r requirements.txt
+```
+
+Dependencias realmente usadas por esta versión:
+
+```text
+python-telegram-bot[job-queue]
+python-dotenv
+pytz
+```
+
+> `google-generativeai` aparece en `requirements.txt` por la versión anterior con IA, pero **esta versión no lo usa**.
+
+## ⚙️ Configuración (`.env`)
+
+Crea un archivo `.env` en la raíz con estas variables (las únicas que usa el bot actual):
+
+```env
+TOKEN_TELEGRAM=tu_token_aqui
+ID_TU_GRUPO=-1001234567890   # ID del grupo (con el signo menos)
+ID_ADMIN=123456789           # Tu ID personal (permisos de admin)
+
+# Horario de publicaciones y seguimientos (formato 24h)
+HORA_INICIO_POST=09:00
+HORA_FIN_POST=22:00
+TIMEZONE=America/Mexico_City  # Ej: America/Bogota, America/New_York
+```
+
+> Las variables `GOOGLE_API_KEY` y `VERSION_PRO` de versiones anteriores **ya no se usan** y pueden eliminarse.
+
+---
+
+## ▶️ Ejecución
+
+### Manual
+```bash
+python main.py
+```
+
+### Con PM2 (recomendado, para que corra en segundo plano)
+```bash
+pm2 start ecosystem.config.js
+pm2 restart bot-telegram   # tras cada cambio en el código
+pm2 logs bot-telegram      # ver registros
+pm2 list                   # estado de los procesos
+```
+
+> El bot corre en tu PC: **debe estar encendida y con PM2 activo** para responder y publicar.
+
+### Posteo sin el celular
+No necesitas el teléfono: instala **Telegram Desktop** (o usa [web.telegram.org](https://web.telegram.org)) en la misma computadora, abre el chat del bot y usa los mismos comandos con el teclado.
+
+---
+
+## ⚙️ Parámetros ajustables (en `main.py`)
+
+| Qué | Dónde | Valor actual |
+|---|---|---|
+| Frecuencia de posts automáticos | `run_repeating(generar_post_automatico, interval=...)` | `21600` s (6 h) |
+| Frecuencia del chequeo de leads fríos | `run_repeating(seguimiento_leads_frios, interval=...)` | `3600` s (1 h) |
+| Horas de silencio para reenganchar | `HORAS_LEAD_FRIO` | `6` |
+| Frases de posts automáticos | `MENSAJES_AUTO_POST` | lista editable |
+| Frases de reenganche | `MENSAJES_SEGUIMIENTO` | lista editable |
+
+---
+
+## 💰 Costo de operación
+
+**0 €/0 $** — Telegram Bot API, SQLite local y hosting en tu propia PC. Sin servicios de pago.

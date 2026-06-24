@@ -1,15 +1,12 @@
 import logging
 import sqlite3
 import os
-import asyncio
+import random
 import re
-import json
 from dotenv import load_dotenv
-from datetime import datetime, time
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from google import genai
-from google.genai import types
 import pytz
 import sys
 
@@ -20,18 +17,13 @@ if hasattr(sys.stdout, "reconfigure"):
 # ================================================================
 
 # ================= CONFIGURACIÓN SEGURA =================
-load_dotenv() # Carga las claves del archivo .env
+load_dotenv()
 
 TOKEN_TELEGRAM = os.getenv("TOKEN_TELEGRAM")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# Configuración de horarios para publicaciones automáticas
-HORA_INICIO_POST = os.getenv("HORA_INICIO_POST", "09:00")  # Default 9 AM
-HORA_FIN_POST = os.getenv("HORA_FIN_POST", "22:00")        # Default 10 PM
-TIMEZONE = os.getenv("TIMEZONE", "America/Mexico_City")     # Default CDMX
-
-# Configuración PRO (activación de features adicionales)
-VERSION_PRO = os.getenv("VERSION_PRO", "false").lower() == "true"
+HORA_INICIO_POST = os.getenv("HORA_INICIO_POST", "09:00")
+HORA_FIN_POST = os.getenv("HORA_FIN_POST", "22:00")
+TIMEZONE = os.getenv("TIMEZONE", "America/Mexico_City")
 
 try:
     ID_TU_GRUPO = int(os.getenv("ID_TU_GRUPO"))
@@ -40,30 +32,41 @@ except TypeError:
     print("❌ ERROR: Revisa tu archivo .env. Los IDs deben ser números.")
     exit()
 
-if not TOKEN_TELEGRAM or not GOOGLE_API_KEY:
-    print("❌ ERROR: Faltan tokens en el archivo .env")
+if not TOKEN_TELEGRAM:
+    print("❌ ERROR: Falta TOKEN_TELEGRAM en el archivo .env")
     exit()
 # ========================================================
 
-client = genai.Client(api_key=GOOGLE_API_KEY)
-MODELO_IA = 'gemini-2.0-flash'
-SAFETY_SETTINGS = [
-    types.SafetySetting(category='HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold='BLOCK_NONE'),
-    types.SafetySetting(category='HARM_CATEGORY_HARASSMENT', threshold='BLOCK_NONE'),
-    types.SafetySetting(category='HARM_CATEGORY_HATE_SPEECH', threshold='BLOCK_NONE'),
-    types.SafetySetting(category='HARM_CATEGORY_DANGEROUS_CONTENT', threshold='BLOCK_NONE'),
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+SEPARADOR = "━━━━━━━━━━━━━━━━━━"
+
+# --- MENSAJES PREDEFINIDOS PARA POSTS AUTOMÁTICOS ---
+MENSAJES_AUTO_POST = [
+    "Ayyy es que hoy ando de un ánimo... mejor escríbeme y te cuento 🙈",
+    "Aquí aburridita pensando en quién se anima a hablarme un ratico 🥺",
+    "No sé ustedes pero yo ya quiero que sea de noche 😏",
+    "Me dijeron que soy mala para responder rápido... vengan y compruébenlo 😌",
+    "Hay cosas que no subo por acá, esas se las muestro en privado 🤭",
+    "Tengo un chisme buenísimo pero solo lo cuento por DM jajaja",
+    "¿Por qué será que el día se me hace más corto cuando hablo con ustedes? 💕",
+    "Honestamente extrañaba molestarlos por aquí 🙃",
+    "Si te quedaste con ganas de hablarme ayer... pues aquí sigo 👀",
+    "Antojada de un café y de una buena conversación, ¿quién se ofrece? ☕",
+    "Hoy amanecí cariñosa, aprovechen antes de que se me pase 😂",
+    "Vení que te tengo paciencia... y un par de sorpresas 😉",
 ]
 
-def generar_contenido(prompt):
-    """Wrapper para llamar a la IA con configuración de seguridad"""
-    response = client.models.generate_content(
-        model=MODELO_IA,
-        contents=prompt,
-        config=types.GenerateContentConfig(safety_settings=SAFETY_SETTINGS)
-    )
-    return response.text
-
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# --- MENSAJES DE REENGANCHE PARA LEADS FRÍOS ---
+HORAS_LEAD_FRIO = 6
+MENSAJES_SEGUIMIENTO = [
+    "Oye {nombre}, ¿te quedaste pensándolo? 👀 Aquí sigo cuando quieras 💕",
+    "{nombre} no me dejes en visto pues 🥺 ¿en qué quedamos?",
+    "¿Todo bien {nombre}? Me dejaste picada con la conversación 🙈",
+    "Hey {nombre}, pasé a saludarte... no creas que me olvidé de ti 😏",
+    "{nombre} mor, ¿seguimos donde nos quedamos o te dio penita? 😂",
+    "Ando por aquí {nombre}, por si te animas a retomar 😌",
+]
 
 # --- BASE DE DATOS LOCAL ---
 def iniciar_db():
@@ -71,11 +74,14 @@ def iniciar_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS usuarios (user_id INTEGER PRIMARY KEY, modo TEXT, nombre TEXT, thread_msg_id INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS mensajes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, texto TEXT, fecha TEXT, tipo TEXT)''')
-    # Migración: agregar thread_msg_id si no existe (para DBs existentes)
     try:
         c.execute("ALTER TABLE usuarios ADD COLUMN thread_msg_id INTEGER")
     except sqlite3.OperationalError:
-        pass  # La columna ya existe
+        pass
+    try:
+        c.execute("ALTER TABLE usuarios ADD COLUMN seguimiento_enviado INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -83,7 +89,7 @@ def guardar_mensaje(user_id, texto, tipo):
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
     fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    texto_guardar = texto if texto else "[FOTO/MEDIA]"
+    texto_guardar = texto if texto else "[MEDIA]"
     c.execute("INSERT INTO mensajes (user_id, texto, fecha, tipo) VALUES (?, ?, ?, ?)", (user_id, texto_guardar, fecha, tipo))
     conn.commit()
     conn.close()
@@ -96,7 +102,6 @@ def set_modo_usuario(user_id, modo, nombre="Usuario", thread_msg_id=None):
     conn.close()
 
 def get_thread_msg_id(user_id):
-    """Obtiene el message_id del hilo de conversación del lead"""
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
     c.execute("SELECT thread_msg_id FROM usuarios WHERE user_id=?", (user_id,))
@@ -104,16 +109,37 @@ def get_thread_msg_id(user_id):
     conn.close()
     return res[0] if res and res[0] else None
 
+def marcar_seguimiento_enviado(user_id):
+    conn = sqlite3.connect('historial_chat.db')
+    c = conn.cursor()
+    c.execute("UPDATE usuarios SET seguimiento_enviado=1 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def resetear_seguimiento(user_id):
+    conn = sqlite3.connect('historial_chat.db')
+    c = conn.cursor()
+    c.execute("UPDATE usuarios SET seguimiento_enviado=0 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
 def get_modo_usuario(user_id):
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
     c.execute("SELECT modo FROM usuarios WHERE user_id=?", (user_id,))
     res = c.fetchone()
     conn.close()
-    return res[0] if res else "ia"
+    return res[0] if res else "nuevo"
+
+def get_nombre_usuario(user_id):
+    conn = sqlite3.connect('historial_chat.db')
+    c = conn.cursor()
+    c.execute("SELECT nombre FROM usuarios WHERE user_id=?", (user_id,))
+    res = c.fetchone()
+    conn.close()
+    return res[0] if res and res[0] else None
 
 def obtener_historial_usuario(user_id, limite=20):
-    """Obtiene el historial de conversación de un usuario para contexto"""
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
     c.execute("""
@@ -126,320 +152,323 @@ def obtener_historial_usuario(user_id, limite=20):
     mensajes = c.fetchall()
     conn.close()
 
-    # Formatear el historial de forma legible
-    historial_formateado = "📜 HISTORIAL DE CONVERSACIÓN:\n" + "="*50 + "\n\n"
-
-    for texto, fecha, tipo in reversed(mensajes):  # Mostrar en orden cronológico
-        emoji = "👤" if tipo == "entrada_usuario" else "🤖"
-        rol = "Usuario" if tipo == "entrada_usuario" else "IA"
+    historial_formateado = "📜 HISTORIAL\n" + SEPARADOR + "\n\n"
+    for texto, fecha, tipo in reversed(mensajes):
+        emoji = "👤" if tipo == "entrada_usuario" else "💬"
+        rol = "Él/Ella" if tipo == "entrada_usuario" else "Tú"
         historial_formateado += f"{emoji} [{fecha}] {rol}:\n{texto}\n\n"
-
-    historial_formateado += "="*50
+    historial_formateado += SEPARADOR
     return historial_formateado
 
-def limpiar_respuesta_ia(texto):
-    """Elimina texto meta de la IA y deja solo el contenido real del mensaje"""
-    # Patrones comunes de texto meta que la IA puede incluir
-    patrones_a_eliminar = [
-        r'^.*?aquí\s+(tienes|está|va)\s+(el\s+)?mensaje.*?:\s*',
-        r'^.*?perfecto[,.]?\s+',
-        r'^claro[,.]?\s+',
-        r'^.*?voy\s+a\s+(escribir|generar|crear).*?:\s*',
-        r'^.*?mensaje\s+para\s+(tu\s+)?grupo.*?:\s*',
-        r'^.*?para\s+(el\s+)?telegram.*?:\s*',
-    ]
-
-    texto_limpio = texto.strip()
-
-    # Aplicar cada patrón de forma case-insensitive
-    for patron in patrones_a_eliminar:
-        texto_limpio = re.sub(patron, '', texto_limpio, flags=re.IGNORECASE | re.MULTILINE)
-
-    return texto_limpio.strip()
-
 def esta_en_horario_permitido():
-    """Verifica si la hora actual está dentro del horario configurado para publicaciones"""
     try:
         tz = pytz.timezone(TIMEZONE)
         ahora = datetime.now(tz)
         hora_actual = ahora.time()
-
-        # Parsear horarios del .env
         hora_inicio = datetime.strptime(HORA_INICIO_POST, "%H:%M").time()
         hora_fin = datetime.strptime(HORA_FIN_POST, "%H:%M").time()
-
-        # Verificar si está en el rango
         if hora_inicio <= hora_fin:
-            # Caso normal: 09:00 - 21:00
             return hora_inicio <= hora_actual <= hora_fin
         else:
-            # Caso que cruza medianoche: 22:00 - 02:00
             return hora_actual >= hora_inicio or hora_actual <= hora_fin
     except Exception as e:
         print(f"⚠️ Error verificando horario: {e}")
-        return True  # Si hay error, permitir publicación por defecto
+        return True
 
 # ==============================================================================
-#  LOGICA DE PUBLICACIÓN AUTOMÁTICA
+#  HELPERS DE HILO / LEAD
+# ==============================================================================
+
+def detectar_tipo_media(msg):
+    if msg.video: return "Video"
+    if msg.photo: return "Foto"
+    if msg.voice: return "Nota de voz"
+    if msg.audio: return "Audio"
+    return "Media"
+
+def extraer_user_id(mensaje):
+    """Busca un (user_id) en el texto o caption de un mensaje."""
+    if not mensaje:
+        return None
+    fuente = mensaje.text or mensaje.caption or ""
+    match = re.search(r'\((\d{5,})\)', fuente)
+    return int(match.group(1)) if match else None
+
+async def abrir_o_obtener_thread(user_id, nombre, context, motivo=""):
+    """
+    Devuelve (thread_msg_id, es_nuevo).
+    Si el lead no tiene anchor, crea uno nuevo en el chat del admin.
+    """
+    modo = get_modo_usuario(user_id)
+    thread_id = get_thread_msg_id(user_id)
+
+    if modo == "humano" and thread_id:
+        return thread_id, False
+
+    etiqueta = "🔁 LEAD REABIERTO" if modo == "cerrado" else "🆕 NUEVO LEAD"
+    header = f"{SEPARADOR}\n{etiqueta}\n👤 {nombre} ({user_id})\n{SEPARADOR}"
+    if motivo:
+        header += f"\n{motivo}"
+
+    msg = await context.bot.send_message(chat_id=ID_ADMIN, text=header)
+    set_modo_usuario(user_id, "humano", nombre, thread_msg_id=msg.message_id)
+    return msg.message_id, True
+
+async def enviar_historial_al_hilo(user_id, thread_id, context):
+    historial = obtener_historial_usuario(user_id, limite=20)
+    if not historial or len(historial) < 100:
+        return
+    max_length = 4000
+    if len(historial) > max_length:
+        chunks = [historial[i:i+max_length] for i in range(0, len(historial), max_length)]
+        for i, chunk in enumerate(chunks):
+            await context.bot.send_message(
+                chat_id=ID_ADMIN,
+                text=f"📋 Contexto ({i+1}/{len(chunks)}):\n{chunk}",
+                reply_to_message_id=thread_id
+            )
+    else:
+        await context.bot.send_message(chat_id=ID_ADMIN, text=historial, reply_to_message_id=thread_id)
+
+# ==============================================================================
+#  PUBLICACIÓN AUTOMÁTICA (MENSAJES PREDEFINIDOS)
 # ==============================================================================
 
 async def generar_post_automatico(context: ContextTypes.DEFAULT_TYPE):
-    """Se ejecuta automáticamente según el tiempo programado"""
-    print("⏰ Ejecutando tarea automática: Generando post...")
+    print("⏰ Ejecutando tarea automática: Publicando post...")
 
-    # Verificar si estamos en horario permitido
     if not esta_en_horario_permitido():
         tz = pytz.timezone(TIMEZONE)
         hora_actual = datetime.now(tz).strftime("%H:%M")
         print(f"⏸️ Post automático omitido. Hora actual: {hora_actual} (Horario: {HORA_INICIO_POST}-{HORA_FIN_POST})")
         return
 
-    # Crear solicitud en formato JSON para que la IA la entienda mejor
-    solicitud_base = {
-        "tarea": "generar_post_telegram",
-        "personaje": {
-            "nombre": "Fer Ruiz",
-            "edad": 27,
-            "origen": "Medellín, Colombia",
-            "ubicacion_actual": "CDMX, México",
-            "profesion": "influencer, Modelo de contenido para adutos"
-        },
-        "caracteristicas_mensaje": {
-            "longitud": "corto (máximo 2-3 líneas)",
-            "tono": ["coqueto", "picarón", "directo", "paisa"],
-            "objetivo": "generar interacción y mensajes privados",
-            "palabras_clave": ["mor", "bebé", "parce", "obvio"],
-            "emojis_sugeridos": ["🔥", "👀", "😈", "💅", "💋"],
-            "evitar": ["saludos genéricos como 'hola chicos'", "introduciones", "explicaciones meta"]
-        },
-        "instruccion": "Genera SOLO el texto del mensaje que se publicará, sin introducciones ni explicaciones adicionales."
-    }
+    mensaje = random.choice(MENSAJES_AUTO_POST)
 
-    # Feature PRO: Posts más personalizados y variados
-    if VERSION_PRO:
-        solicitud_base["variantes_pro"] = {
-            "estilos_disponibles": [
-                "pregunta_provocativa",
-                "historia_corta_intrigante",
-                "consejo_atrevido",
-                "confesion_picante"
-            ],
-            "instruccion": "Alterna entre los estilos disponibles y hazlo único cada vez"
-        }
-
-    # Convertir la solicitud a JSON y crear el prompt
-    solicitud_json = json.dumps(solicitud_base, ensure_ascii=False, indent=2)
-    prompt = f"""Recibiste la siguiente solicitud en formato JSON para mejor comprensión:
-
-{solicitud_json}
-
-Basándote en esta solicitud estructurada, genera el mensaje solicitado. Responde ÚNICAMENTE con el texto del mensaje, nada más."""
+    keyboard = [[InlineKeyboardButton("🔥 Escríbeme por privado", url=f"https://t.me/{context.bot.username}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
-        mensaje_ia = generar_contenido(prompt)
-
-        # Limpiar respuesta de la IA para eliminar texto meta
-        mensaje_limpio = limpiar_respuesta_ia(mensaje_ia)
-        mensaje_final = f"\n\n{mensaje_limpio}"
-
-        keyboard = [[InlineKeyboardButton("🔥 Escríbeme por privado", url=f"https://t.me/{context.bot.username}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await context.bot.send_message(chat_id=ID_TU_GRUPO, text=mensaje_final, reply_markup=reply_markup)
-        print(f"✅ Post publicado exitosamente (PRO: {VERSION_PRO})")
-
+        await context.bot.send_message(chat_id=ID_TU_GRUPO, text=mensaje, reply_markup=reply_markup)
+        print(f"✅ Post publicado: {mensaje[:50]}...")
     except Exception as e:
         print(f"❌ Error en el post automático: {e}")
 
 # ==============================================================================
-#  EL CEREBRO INTELIGENTE (IA CLASIFICADORA Y PERSONALIDAD)
+#  MANEJO DE USUARIOS → ADMIN
 # ==============================================================================
 
 async def manejar_mensaje_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type != "private": return
+    if update.message.chat.type != "private":
+        return
+
     user_id = update.effective_user.id
     texto = update.message.text
     nombre = update.effective_user.first_name
-    
+
     guardar_mensaje(user_id, texto, "entrada_usuario")
-    
-    # Si ya está en modo humano, reenvía al hilo del lead
-    modo = get_modo_usuario(user_id)
-    if modo == "humano":
-        thread_id = get_thread_msg_id(user_id)
-        await context.bot.send_message(
-            chat_id=ID_ADMIN,
-            text=f"💬 {nombre} ({user_id}):\n{texto}",
-            reply_to_message_id=thread_id
+    resetear_seguimiento(user_id)
+
+    thread_id, es_nuevo = await abrir_o_obtener_thread(user_id, nombre, context)
+
+    await context.bot.send_message(
+        chat_id=ID_ADMIN,
+        text=f"👤 {nombre} ({user_id}):\n{texto}",
+        reply_to_message_id=thread_id
+    )
+
+    if es_nuevo:
+        await enviar_historial_al_hilo(user_id, thread_id, context)
+        await update.message.reply_text(
+            f"¡Quiubo {nombre} mor! 💅 Ya te leo, te respondo en un momentico 🔥"
         )
+
+async def usuario_envia_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reenvía fotos/videos/audios/notas de voz del usuario al hilo del admin."""
+    if update.message.chat.type != "private":
         return
 
-    # --- CLASIFICACIÓN + RESPUESTA EN UNA SOLA LLAMADA ---
-    try:
-        prompt_base = f"""Eres "Fer Ruiz", una influencer colombiana (paisa) de 27 años viviendo en CDMX.
-Tu tono es: Coqueta, picaróna, relajada y muy "de barrio" pero fresa.
-Palabras obligatorias: Mor, bebé, parce, nea, qué más pues, obvio bobis.
-NUNCA respondas como robot ("Soy una IA", "En qué puedo ayudarte").
-Si te saludan, no digas "Hola". Di algo como: "Quiubo mor", "Hola bebé".
-Usa emojis en cada mensaje: 🔥, 😈, 👀, 💅.
-Tus respuestas deben ser CORTAS (máximo 2 líneas).
+    user_id = update.effective_user.id
+    nombre = update.effective_user.first_name
+    tipo = detectar_tipo_media(update.message)
+    caption_original = update.message.caption or ""
 
-Ejemplos de cómo respondes:
-User: ¿Qué haces?
-Tú: Aquí pensando en cuándo me vas a invitar a salir mor 💅
+    guardar_mensaje(user_id, f"[{tipo.upper()}]" + (f" {caption_original}" if caption_original else ""), "entrada_usuario")
+    resetear_seguimiento(user_id)
 
-User: Eres un robot?
-Tú: Obvio no bobis, soy tu tormento 😈
+    thread_id, es_nuevo = await abrir_o_obtener_thread(user_id, nombre, context)
 
-User: Te ves bien
-Tú: Yo sé que te encanto parce, no lo niegues 💅🔥
+    # Header con el ID para que el admin pueda hacer reply fácil
+    header = f"📎 {nombre} ({user_id}) envió {tipo}:"
+    if caption_original:
+        header += f"\n💬 {caption_original}"
 
-REGLA IMPORTANTE DE CLASIFICACIÓN:
-Analiza el mensaje del usuario. Si detectas intención de COMPRA, PRECIOS, CONTRATAR o COLABORAR, tu respuesta DEBE empezar EXACTAMENTE con "[VENTA]" seguido de un mensaje coqueto relacionado.
-Si es charla casual, saludo o broma, responde normal SIN ninguna etiqueta.
+    await context.bot.send_message(chat_id=ID_ADMIN, text=header, reply_to_message_id=thread_id)
+    # Reenvío real del media, también como reply al hilo
+    await context.bot.copy_message(
+        chat_id=ID_ADMIN,
+        from_chat_id=user_id,
+        message_id=update.message.message_id,
+        reply_to_message_id=thread_id
+    )
 
-Ejemplos de clasificación:
-User: "Cuánto cobras?"
-Tú: [VENTA] Uff mi amor, te paso toda la info para tratarte como mereces 👀🔥
-
-User: "Quiero comprar contenido"
-Tú: [VENTA] Ay bebé, obvio que sí, déjame te cuento todo mor 💅
-
-User: "Hola bb"
-Tú: Quiubo mor, qué más pues 😈🔥"""
-
-        # Feature PRO: Memoria conversacional
-        if VERSION_PRO:
-            conn = sqlite3.connect('historial_chat.db')
-            c = conn.cursor()
-            c.execute("""
-                SELECT texto, tipo FROM mensajes
-                WHERE user_id=?
-                ORDER BY fecha DESC
-                LIMIT 5
-            """, (user_id,))
-            mensajes_recientes = c.fetchall()
-            conn.close()
-
-            contexto_previo = "\n\nCONTEXTO DE LA CONVERSACIÓN RECIENTE:\n"
-            for msg, tipo in reversed(mensajes_recientes):
-                rol = "Usuario" if tipo == "entrada_usuario" else "Tú"
-                contexto_previo += f"{rol}: {msg}\n"
-
-            prompt_final = prompt_base + contexto_previo + f"\n\nAHORA RESPONDE (considera el contexto):\nUser: \"{texto}\"\nTú:"
-        else:
-            prompt_final = prompt_base + f"\n\nAHORA RESPONDE:\nUser: \"{texto}\"\nTú:"
-
-        respuesta_ia = generar_contenido(prompt_final).strip()
-        print(f"🧠 IA Responde a '{texto}' -> {respuesta_ia[:80]}...")
-
-        # Detectar si la IA clasificó como VENTA
-        if respuesta_ia.startswith("[VENTA]"):
-            mensaje_usuario = respuesta_ia.replace("[VENTA]", "").strip()
-            await update.message.reply_text(mensaje_usuario)
-            guardar_mensaje(user_id, mensaje_usuario, "salida_ia")
-
-            # ACTIVAR MODO HUMANO
-            notificacion = f"🚨 LEAD CALIENTE (IA) 🚨\nUsuario: {nombre} ({user_id})\nIntención Detectada: Negocios\nMensaje que activó lead: {texto}"
-            msg_notificacion = await context.bot.send_message(chat_id=ID_ADMIN, text=notificacion)
-            set_modo_usuario(user_id, "humano", nombre, thread_msg_id=msg_notificacion.message_id)
-
-            # Enviar historial como respuesta al hilo del lead
-            historial = obtener_historial_usuario(user_id, limite=20)
-            if historial and len(historial) > 100:
-                max_length = 4000
-                if len(historial) > max_length:
-                    chunks = [historial[i:i+max_length] for i in range(0, len(historial), max_length)]
-                    for i, chunk in enumerate(chunks):
-                        await context.bot.send_message(chat_id=ID_ADMIN, text=f"📋 Contexto (parte {i+1}/{len(chunks)}):\n{chunk}", reply_to_message_id=msg_notificacion.message_id)
-                else:
-                    await context.bot.send_message(chat_id=ID_ADMIN, text=historial, reply_to_message_id=msg_notificacion.message_id)
-        else:
-            # MODO CHAT normal
-            await update.message.reply_text(respuesta_ia)
-            guardar_mensaje(user_id, respuesta_ia, "salida_ia")
-
-    except Exception as e:
-        print(f"Error IA: {e}")
-        await update.message.reply_text("Dame un segundo mor, estoy revisando algo...")
+    if es_nuevo:
+        await enviar_historial_al_hilo(user_id, thread_id, context)
+        await update.message.reply_text(f"¡Ya me llegó mor! 🔥 Ahorita te contesto 💋")
 
 # ==============================================================================
-#  FUNCIONES DE ADMINISTRADOR (TÚ)
+#  FUNCIONES DE ADMINISTRADOR
 # ==============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    set_modo_usuario(user.id, "ia", user.first_name)
+    nombre = user.first_name
 
-    mensaje_bienvenida = f"¡Hola {user.first_name}! ¿Qué se te antoja hacer hoy mor?"
+    thread_id, es_nuevo = await abrir_o_obtener_thread(user.id, nombre, context, motivo="(usuario envió /start)")
 
-    # Feature PRO: Mensaje de bienvenida personalizado
-    if VERSION_PRO:
-        mensaje_bienvenida += " ✨\n\n💎 Que pues mor, estoy con unas ganas de que nos veamos... 🔥"
+    if es_nuevo:
+        await enviar_historial_al_hilo(user.id, thread_id, context)
 
-    await update.message.reply_text(mensaje_bienvenida)
+    await update.message.reply_text(
+        f"¡Hola {nombre} bebé! 💋\n\nEscríbeme lo que quieras por aquí y te contesto personalmente 🔥"
+    )
 
 async def admin_responde_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message: return
-
-    # Buscar el ID del usuario en toda la cadena de respuestas
-    texto_original = update.message.reply_to_message.text or ""
-    match = re.search(r'\((\d{5,})\)', texto_original)
-
-    if match:
-        try:
-            id_usuario_destino = int(match.group(1))
-            await context.bot.send_message(chat_id=id_usuario_destino, text=update.message.text)
-
-            # Confirmar y agrupar en el hilo del lead
-            thread_id = get_thread_msg_id(id_usuario_destino)
-            await context.bot.send_message(
-                chat_id=ID_ADMIN,
-                text=f"✅ Tú respondiste:\n{update.message.text}",
-                reply_to_message_id=thread_id
-            )
-            guardar_mensaje(id_usuario_destino, update.message.text, "salida_humano")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error al enviar: {e}")
-    else:
-        await update.message.reply_text("⚠️ No encontré el ID. Responde a un mensaje del bot que tenga el ID entre paréntesis.")
-
-async def cerrar_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /cerrar para devolver al usuario a la IA"""
-    if update.effective_user.id != ID_ADMIN: return
-    
     if not update.message.reply_to_message:
-        await update.message.reply_text("⚠️ Tienes que responder (Reply) al mensaje del usuario para cerrar su ticket.")
         return
 
-    texto_original = update.message.reply_to_message.text or ""
-    match = re.search(r'\((\d{5,})\)', texto_original)
-
-    if match:
-        id_usuario = int(match.group(1))
-        set_modo_usuario(id_usuario, "ia") # <--- AQUÍ SE RESETEA EL MODO
-        
-        await update.message.reply_text(f"✅ Ticket cerrado. El usuario {id_usuario} regresa con la IA.")
-        await context.bot.send_message(chat_id=id_usuario, text="Cualquier cosa no dudes en avisarme mor. 👋")
-    else:
-        await update.message.reply_text("❌ No encontré el ID para cerrar el ticket.")
-
-async def publicar_media_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Publica fotos o videos del admin al grupo"""
-    texto_caption = update.message.caption if update.message.caption else ""
-    keyboard = [[InlineKeyboardButton("🔥 Escribeme al privado mor", url=f"https://t.me/{context.bot.username}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    tipo = "Video" if update.message.video else "Foto"
+    id_usuario_destino = extraer_user_id(update.message.reply_to_message)
+    if not id_usuario_destino:
+        await update.message.reply_text("⚠️ No encontré el ID. Responde a un mensaje del bot que tenga el ID entre paréntesis.")
+        return
 
     try:
-        await context.bot.copy_message(chat_id=ID_TU_GRUPO, from_chat_id=ID_ADMIN, message_id=update.message.message_id, caption=texto_caption, reply_markup=reply_markup)
+        await context.bot.send_message(chat_id=id_usuario_destino, text=update.message.text)
+
+        thread_id = get_thread_msg_id(id_usuario_destino)
+        await context.bot.send_message(
+            chat_id=ID_ADMIN,
+            text=f"✅ Tú → ({id_usuario_destino}):\n{update.message.text}",
+            reply_to_message_id=thread_id
+        )
+        guardar_mensaje(id_usuario_destino, update.message.text, "salida_humano")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error al enviar: {e}")
+
+async def publicar_media_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Si el admin hace REPLY a un mensaje con ID → envía el media solo a ese lead.
+    Si NO es reply → publica al grupo con botón de CTA.
+    """
+    tipo = detectar_tipo_media(update.message)
+    caption_admin = update.message.caption or ""
+
+    # Caso 1: admin respondiendo a un lead → enviar al lead solamente
+    id_destino = extraer_user_id(update.message.reply_to_message) if update.message.reply_to_message else None
+    if id_destino:
+        try:
+            await context.bot.copy_message(
+                chat_id=id_destino,
+                from_chat_id=ID_ADMIN,
+                message_id=update.message.message_id,
+                caption=caption_admin
+            )
+            thread_id = get_thread_msg_id(id_destino)
+            confirmacion = f"✅ Tú → ({id_destino}) enviaste {tipo}"
+            if caption_admin:
+                confirmacion += f"\n💬 {caption_admin}"
+            await context.bot.send_message(
+                chat_id=ID_ADMIN,
+                text=confirmacion,
+                reply_to_message_id=thread_id
+            )
+            guardar_mensaje(id_destino, f"[{tipo.upper()}]" + (f" {caption_admin}" if caption_admin else ""), "salida_humano")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error enviando al lead: {e}")
+        return
+
+    # Caso 2: publicación al grupo
+    keyboard = [[InlineKeyboardButton("🔥 Escribeme al privado mor", url=f"https://t.me/{context.bot.username}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    try:
+        await context.bot.copy_message(
+            chat_id=ID_TU_GRUPO,
+            from_chat_id=ID_ADMIN,
+            message_id=update.message.message_id,
+            caption=caption_admin,
+            reply_markup=reply_markup
+        )
         await update.message.reply_text(f"✅ {tipo} publicado/a en el grupo.")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
+async def cerrar_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ID_ADMIN:
+        return
+
+    if not update.message.reply_to_message:
+        await update.message.reply_text("⚠️ Responde (Reply) a un mensaje del lead para cerrar su ticket.\nO usa /cerrarid <user_id>")
+        return
+
+    id_usuario = extraer_user_id(update.message.reply_to_message)
+    if not id_usuario:
+        await update.message.reply_text("❌ No encontré el ID en el mensaje al que respondiste.")
+        return
+
+    set_modo_usuario(id_usuario, "cerrado", get_nombre_usuario(id_usuario) or "Usuario")
+    await update.message.reply_text(f"✅ Ticket cerrado para ({id_usuario}).")
+    try:
+        await context.bot.send_message(chat_id=id_usuario, text="Cualquier cosa no dudes en avisarme mor. 👋")
+    except Exception:
+        pass
+
+async def cerrar_por_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cierra un ticket por ID sin necesidad de reply."""
+    if update.effective_user.id != ID_ADMIN:
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Uso: /cerrarid <user_id>")
+        return
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ El ID debe ser un número.")
+        return
+
+    set_modo_usuario(user_id, "cerrado", get_nombre_usuario(user_id) or "Usuario")
+    await update.message.reply_text(f"✅ Ticket cerrado para ({user_id}).")
+    try:
+        await context.bot.send_message(chat_id=user_id, text="Cualquier cosa no dudes en avisarme mor. 👋")
+    except Exception:
+        pass
+
+async def abrir_conversacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Trae al tope del chat el hilo de un lead (útil para no perderse)."""
+    if update.effective_user.id != ID_ADMIN:
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Uso: /abrir <user_id>")
+        return
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ El ID debe ser un número.")
+        return
+
+    nombre = get_nombre_usuario(user_id)
+    if not nombre:
+        await update.message.reply_text(f"⚠️ No hay registro del usuario {user_id}.")
+        return
+
+    # Forzar creación de nuevo anchor (aunque ya exista)
+    set_modo_usuario(user_id, "cerrado", nombre)  # lo marca como cerrado para que el helper cree nuevo anchor
+    thread_id, _ = await abrir_o_obtener_thread(user_id, nombre, context, motivo="(reabierto manualmente)")
+    await enviar_historial_al_hilo(user_id, thread_id, context)
+    await update.message.reply_text(f"✅ Hilo de {nombre} ({user_id}) reabierto arriba ⬆️")
+
 async def postear_texto_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ID_ADMIN: return
+    if update.effective_user.id != ID_ADMIN:
+        return
 
     mensaje = " ".join(context.args)
     if not mensaje:
@@ -456,12 +485,11 @@ async def postear_texto_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ Error: {e}")
 
 async def ver_historial_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /historial [user_id] para que el admin vea el historial de un usuario"""
     if update.effective_user.id != ID_ADMIN:
         return
 
-    if not context.args or len(context.args) < 1:
-        await update.message.reply_text("❌ Uso: /historial [user_id]\nEjemplo: /historial 123456789")
+    if not context.args:
+        await update.message.reply_text("❌ Uso: /historial <user_id>")
         return
 
     try:
@@ -469,7 +497,6 @@ async def ver_historial_usuario(update: Update, context: ContextTypes.DEFAULT_TY
         historial = obtener_historial_usuario(user_id, limite=30)
 
         if len(historial) > 100:
-            # Dividir en chunks si es necesario
             max_length = 4000
             if len(historial) > max_length:
                 chunks = [historial[i:i+max_length] for i in range(0, len(historial), max_length)]
@@ -478,7 +505,7 @@ async def ver_historial_usuario(update: Update, context: ContextTypes.DEFAULT_TY
             else:
                 await update.message.reply_text(historial)
         else:
-            await update.message.reply_text(f"⚠️ No hay historial suficiente para el usuario {user_id}")
+            await update.message.reply_text(f"⚠️ No hay historial suficiente para ({user_id})")
 
     except ValueError:
         await update.message.reply_text("❌ El ID debe ser un número válido")
@@ -486,7 +513,6 @@ async def ver_historial_usuario(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"❌ Error: {e}")
 
 async def ver_leads_activos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /leads para ver todos los leads activos (solo admin)"""
     if update.effective_user.id != ID_ADMIN:
         return
 
@@ -508,19 +534,21 @@ async def ver_leads_activos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ No hay leads activos en este momento.")
             return
 
-        texto = f"🔥 LEADS ACTIVOS ({len(leads)})\n{'='*40}\n\n"
+        texto = f"🔥 LEADS ACTIVOS ({len(leads)})\n{SEPARADOR}\n\n"
         for i, (nombre, uid, ultimo_msg) in enumerate(leads, 1):
             fecha = ultimo_msg if ultimo_msg else "Sin mensajes"
-            texto += f"{i}. {nombre} ({uid})\n   📅 Último msg: {fecha}\n\n"
+            texto += f"{i}. 👤 {nombre} ({uid})\n   📅 {fecha}\n\n"
 
-        texto += f"{'='*40}\n💡 Usa /cerrar (reply) para cerrar uno\n💡 Usa /cerrartodos para cerrar todos"
+        texto += SEPARADOR + "\n"
+        texto += "💡 /abrir <id> → trae el hilo arriba\n"
+        texto += "💡 /cerrarid <id> → cierra sin reply\n"
+        texto += "💡 /cerrartodos → cierra todos"
         await update.message.reply_text(texto)
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
 async def cerrar_todos_leads(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /cerrartodos para cerrar todos los leads activos de una vez"""
     if update.effective_user.id != ID_ADMIN:
         return
 
@@ -535,11 +563,10 @@ async def cerrar_todos_leads(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("✅ No hay leads activos para cerrar.")
             return
 
-        c.execute("UPDATE usuarios SET modo='ia' WHERE modo='humano'")
+        c.execute("UPDATE usuarios SET modo='cerrado' WHERE modo='humano'")
         conn.commit()
         conn.close()
 
-        # Notificar a cada usuario
         errores = 0
         for user_id, nombre in leads:
             try:
@@ -560,7 +587,6 @@ async def cerrar_todos_leads(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"❌ Error: {e}")
 
 async def ver_estadisticas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /stats para ver estadísticas del bot (solo admin)"""
     if update.effective_user.id != ID_ADMIN:
         return
 
@@ -568,19 +594,15 @@ async def ver_estadisticas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn = sqlite3.connect('historial_chat.db')
         c = conn.cursor()
 
-        # Total de usuarios
         c.execute("SELECT COUNT(DISTINCT user_id) FROM usuarios")
         total_usuarios = c.fetchone()[0]
 
-        # Usuarios en modo humano (leads activos)
         c.execute("SELECT COUNT(*) FROM usuarios WHERE modo='humano'")
         leads_activos = c.fetchone()[0]
 
-        # Total de mensajes
         c.execute("SELECT COUNT(*) FROM mensajes")
         total_mensajes = c.fetchone()[0]
 
-        # Últimos 5 usuarios activos
         c.execute("""
             SELECT u.nombre, u.user_id, u.modo, COUNT(m.id) as msg_count
             FROM usuarios u
@@ -592,17 +614,15 @@ async def ver_estadisticas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usuarios_recientes = c.fetchall()
         conn.close()
 
-        # Formatear respuesta
-        stats = f"📊 ESTADÍSTICAS DEL BOT\n{'='*40}\n\n"
+        stats = f"📊 ESTADÍSTICAS DEL BOT\n{SEPARADOR}\n\n"
         stats += f"👥 Total usuarios: {total_usuarios}\n"
         stats += f"🔥 Leads activos: {leads_activos}\n"
         stats += f"💬 Total mensajes: {total_mensajes}\n"
-        stats += f"💎 Modo PRO: {'Activado' if VERSION_PRO else 'Desactivado'}\n"
         stats += f"⏰ Horario posts: {HORA_INICIO_POST} - {HORA_FIN_POST}\n\n"
         stats += f"📋 ÚLTIMOS 5 USUARIOS ACTIVOS:\n"
 
         for nombre, uid, modo, msg_count in usuarios_recientes:
-            emoji = "🔥" if modo == "humano" else "🤖"
+            emoji = "🔥" if modo == "humano" else "💤"
             stats += f"{emoji} {nombre} ({uid}): {msg_count} msgs\n"
 
         await update.message.reply_text(stats)
@@ -610,38 +630,161 @@ async def ver_estadisticas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error obteniendo estadísticas: {e}")
 
+# ==============================================================================
+#  SEGUIMIENTO AUTOMÁTICO DE LEADS FRÍOS
+# ==============================================================================
+
+async def seguimiento_leads_frios(context: ContextTypes.DEFAULT_TYPE):
+    """Reengancha leads activos que el admin respondió y llevan HORAS_LEAD_FRIO
+    en silencio. Envía el mensaje una sola vez (hasta que el lead vuelva a escribir)
+    y solo dentro del horario permitido."""
+    if not esta_en_horario_permitido():
+        return
+
+    limite = (datetime.now() - timedelta(hours=HORAS_LEAD_FRIO)).strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect('historial_chat.db')
+    c = conn.cursor()
+    c.execute("""
+        SELECT u.user_id, u.nombre, MAX(m.fecha) AS ultima,
+               (SELECT tipo FROM mensajes WHERE user_id=u.user_id ORDER BY fecha DESC LIMIT 1) AS ultimo_tipo
+        FROM usuarios u
+        JOIN mensajes m ON u.user_id = m.user_id
+        WHERE u.modo='humano' AND COALESCE(u.seguimiento_enviado, 0) = 0
+        GROUP BY u.user_id
+        HAVING ultima < ? AND ultimo_tipo = 'salida_humano'
+    """, (limite,))
+    frios = c.fetchall()
+    conn.close()
+
+    if not frios:
+        return
+
+    print(f"🔁 Seguimiento: {len(frios)} lead(s) frío(s) detectado(s).")
+    for user_id, nombre, ultima, ultimo_tipo in frios:
+        mensaje = random.choice(MENSAJES_SEGUIMIENTO).format(nombre=nombre or "mor")
+        try:
+            await context.bot.send_message(chat_id=user_id, text=mensaje)
+            guardar_mensaje(user_id, mensaje, "salida_humano")
+            marcar_seguimiento_enviado(user_id)
+            thread_id = get_thread_msg_id(user_id)
+            await context.bot.send_message(
+                chat_id=ID_ADMIN,
+                text=f"🔁 Seguimiento automático → {nombre} ({user_id}):\n{mensaje}",
+                reply_to_message_id=thread_id
+            )
+        except Exception as e:
+            print(f"⚠️ Error en seguimiento a {user_id}: {e}")
+
+async def enviar_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Envía un mensaje de promoción a todos los leads (activos + cerrados)."""
+    if update.effective_user.id != ID_ADMIN:
+        return
+
+    mensaje = " ".join(context.args)
+    if not mensaje:
+        await update.message.reply_text(
+            "❌ Uso: /promo <texto de la promo>\n\nEj: /promo Hoy 20% de descuento solo por las próximas 2 horas 🔥"
+        )
+        return
+
+    conn = sqlite3.connect('historial_chat.db')
+    c = conn.cursor()
+    c.execute("SELECT user_id, nombre FROM usuarios WHERE modo IN ('humano', 'cerrado')")
+    destinatarios = c.fetchall()
+    conn.close()
+
+    if not destinatarios:
+        await update.message.reply_text("⚠️ No hay leads a quienes enviarles la promo.")
+        return
+
+    await update.message.reply_text(f"📤 Enviando promo a {len(destinatarios)} lead(s)...")
+
+    enviados = 0
+    errores = 0
+    for user_id, nombre in destinatarios:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=mensaje)
+            guardar_mensaje(user_id, f"[PROMO] {mensaje}", "salida_humano")
+            enviados += 1
+        except Exception:
+            errores += 1
+
+    resumen = f"✅ Promo enviada a {enviados} lead(s)."
+    if errores:
+        resumen += f"\n⚠️ {errores} no la recibieron (bloquearon el bot o nunca lo iniciaron)."
+    await update.message.reply_text(resumen)
+
+# --- MENÚ DE COMANDOS ---
+async def configurar_menu(app):
+    """Configura el menú '/' del bot: comandos completos para el admin,
+    solo /start para los usuarios normales."""
+    comandos_admin = [
+        BotCommand("post", "Publicar un mensaje al grupo"),
+        BotCommand("promo", "Enviar una promo a todos los leads"),
+        BotCommand("leads", "Ver leads activos"),
+        BotCommand("stats", "Ver estadísticas del bot"),
+        BotCommand("historial", "Ver historial de un usuario <id>"),
+        BotCommand("abrir", "Reabrir el hilo de un lead <id>"),
+        BotCommand("cerrar", "Cerrar ticket (responde al lead)"),
+        BotCommand("cerrarid", "Cerrar ticket por <id>"),
+        BotCommand("cerrartodos", "Cerrar todos los leads activos"),
+    ]
+    comandos_usuario = [
+        BotCommand("start", "Iniciar conversación"),
+    ]
+    # Menú para todos los usuarios (mínimo)
+    await app.bot.set_my_commands(comandos_usuario, scope=BotCommandScopeDefault())
+    # Menú completo solo en tu chat de admin
+    await app.bot.set_my_commands(comandos_admin, scope=BotCommandScopeChat(chat_id=ID_ADMIN))
+    print("✅ Menú de comandos configurado.")
+
 # --- ARRANQUE ---
 def main():
     iniciar_db()
-    app = Application.builder().token(TOKEN_TELEGRAM).build()
+    app = Application.builder().token(TOKEN_TELEGRAM).post_init(configurar_menu).build()
 
-    # --- ORDEN DE LOS HANDLERS (CRÍTICO) ---
-
-    # 1. Comandos (Siempre van primero)
+    # Comandos
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("post", postear_texto_grupo))
+    app.add_handler(CommandHandler("promo", enviar_promo))
     app.add_handler(CommandHandler("cerrar", cerrar_ticket))
-    app.add_handler(CommandHandler("stats", ver_estadisticas))
-    app.add_handler(CommandHandler("leads", ver_leads_activos))
+    app.add_handler(CommandHandler("cerrarid", cerrar_por_id))
     app.add_handler(CommandHandler("cerrartodos", cerrar_todos_leads))
+    app.add_handler(CommandHandler("abrir", abrir_conversacion))
+    app.add_handler(CommandHandler("leads", ver_leads_activos))
+    app.add_handler(CommandHandler("stats", ver_estadisticas))
     app.add_handler(CommandHandler("historial", ver_historial_usuario))
 
-    # 2. Multimedia y Admin (Ignoran comandos)
-    app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO) & filters.ChatType.PRIVATE & filters.User(ID_ADMIN), publicar_media_admin))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE & filters.User(ID_ADMIN), admin_responde_texto))
+    # Admin: media (reply a lead = enviar; sin reply = publicar al grupo)
+    app.add_handler(MessageHandler(
+        (filters.PHOTO | filters.VIDEO | filters.VOICE | filters.AUDIO) & filters.ChatType.PRIVATE & filters.User(ID_ADMIN),
+        publicar_media_admin
+    ))
+    # Admin: texto (responder a lead)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE & filters.User(ID_ADMIN),
+        admin_responde_texto
+    ))
 
-    # 3. Usuarios Generales (IA) - Siempre al final
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.User(ID_ADMIN), manejar_mensaje_usuario))
+    # Usuario: texto
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.User(ID_ADMIN),
+        manejar_mensaje_usuario
+    ))
+    # Usuario: media (foto/video/voz/audio) → reenvía al hilo del admin
+    app.add_handler(MessageHandler(
+        (filters.PHOTO | filters.VIDEO | filters.VOICE | filters.AUDIO) & filters.ChatType.PRIVATE & ~filters.User(ID_ADMIN),
+        usuario_envia_media
+    ))
 
-    # Cron Job (4 Horas = 14400 segundos)
     job_queue = app.job_queue
-    job_queue.run_repeating(generar_post_automatico, interval=14400, first=30)
+    job_queue.run_repeating(generar_post_automatico, interval=21600, first=30)
+    job_queue.run_repeating(seguimiento_leads_frios, interval=3600, first=60)
 
-    version_texto = "PRO 💎" if VERSION_PRO else "FREE"
-    print(f"🤖 Bot Paisa 4.0 Iniciado ({version_texto})")
+    print("🤖 Bot Paisa 4.0 Iniciado (MODO PRIVADO DIRECTO)")
     print(f"⏰ Horario de publicaciones: {HORA_INICIO_POST} - {HORA_FIN_POST} ({TIMEZONE})")
-    print(f"✨ Features PRO: {'Activadas' if VERSION_PRO else 'Desactivadas'}")
-    print("="*50)
+    print(SEPARADOR)
     app.run_polling()
 
 if __name__ == '__main__':
