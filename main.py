@@ -1,10 +1,11 @@
+import asyncio
 import logging
 import sqlite3
 import os
 import random
 import re
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import pytz
@@ -38,6 +39,8 @@ if not TOKEN_TELEGRAM:
 # ========================================================
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# httpx registra cada request con la URL completa (incluye el TOKEN del bot) → solo warnings
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 SEPARADOR = "━━━━━━━━━━━━━━━━━━"
 
@@ -68,6 +71,16 @@ MENSAJES_SEGUIMIENTO = [
     "Ando por aquí {nombre}, por si te animas a retomar 😌",
 ]
 
+# --- BIENVENIDA A NUEVOS MIEMBROS DEL GRUPO ---
+MENSAJES_BIENVENIDA = [
+    "¡Llegó gente linda! 😍 Bienvenido {nombre}, ponte cómodo... y si te da curiosidad algo, ya sabes dónde encontrarme 😏",
+    "Uy {nombre}, qué bueno que llegaste 🥰 Por aquí ando yo, no seas tímido y escríbeme cuando quieras 💕",
+    "Bienvenido {nombre} 🙈 Aquí la pasamos rico... y en mi privado mejor 🤭",
+    "¡{nombre} bienvenido mor! 💅 Date una vuelta por el grupo y cualquier cosita me escribes 😘",
+    "Miren quién llegó... {nombre} 👀 Bienvenido bebé, escríbeme y nos conocemos mejor 🔥",
+    "¡Hola {nombre}! 😍 Qué rico tenerte por aquí. El botón de abajo es tu puerta directa a mí 😏",
+]
+
 # --- CONTROL DE LEADS ESPERANDO RESPUESTA ---
 MIN_ESPERA_LEAD = 20        # min sin respuesta del admin antes de mandarle un "ya casi te atiendo" al lead
 MIN_PENDIENTE_ADMIN = 15    # min que un lead lleva esperando para contar como pendiente en el recordatorio al admin
@@ -82,8 +95,10 @@ MENSAJES_ESPERA = [
 def iniciar_db():
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL")  # evita 'database is locked' entre jobs y handlers
     c.execute('''CREATE TABLE IF NOT EXISTS usuarios (user_id INTEGER PRIMARY KEY, modo TEXT, nombre TEXT, thread_msg_id INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS mensajes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, texto TEXT, fecha TEXT, tipo TEXT)''')
+    c.execute('''CREATE INDEX IF NOT EXISTS idx_mensajes_user_fecha ON mensajes(user_id, fecha)''')
     try:
         c.execute("ALTER TABLE usuarios ADD COLUMN thread_msg_id INTEGER")
     except sqlite3.OperationalError:
@@ -109,9 +124,20 @@ def guardar_mensaje(user_id, texto, tipo):
     conn.close()
 
 def set_modo_usuario(user_id, modo, nombre="Usuario", thread_msg_id=None):
+    """Upsert real: no borra la fila (INSERT OR REPLACE perdía columnas no listadas).
+    Al cambiar de modo se resetean las banderas de avisos, explícitamente."""
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO usuarios (user_id, modo, nombre, thread_msg_id) VALUES (?, ?, ?, ?)", (user_id, modo, nombre, thread_msg_id))
+    c.execute("""
+        INSERT INTO usuarios (user_id, modo, nombre, thread_msg_id, seguimiento_enviado, espera_avisada)
+        VALUES (?, ?, ?, ?, 0, 0)
+        ON CONFLICT(user_id) DO UPDATE SET
+            modo=excluded.modo,
+            nombre=excluded.nombre,
+            thread_msg_id=excluded.thread_msg_id,
+            seguimiento_enviado=0,
+            espera_avisada=0
+    """, (user_id, modo, nombre, thread_msg_id))
     conn.commit()
     conn.close()
 
@@ -212,6 +238,10 @@ def detectar_tipo_media(msg):
     if msg.photo: return "Foto"
     if msg.voice: return "Nota de voz"
     if msg.audio: return "Audio"
+    if msg.video_note: return "Video-nota"
+    if msg.sticker: return "Sticker"
+    if msg.animation: return "GIF"       # antes que document: los GIF traen ambos campos
+    if msg.document: return "Documento"
     return "Media"
 
 def extraer_user_id(mensaje):
@@ -362,6 +392,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def admin_responde_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ID_ADMIN:
+        return
     if not update.message.reply_to_message:
         return
 
@@ -389,6 +421,8 @@ async def publicar_media_admin(update: Update, context: ContextTypes.DEFAULT_TYP
     Si el admin hace REPLY a un mensaje con ID → envía el media solo a ese lead.
     Si NO es reply → publica al grupo con botón de CTA.
     """
+    if update.effective_user.id != ID_ADMIN:
+        return
     tipo = detectar_tipo_media(update.message)
     caption_admin = update.message.caption or ""
 
@@ -400,7 +434,7 @@ async def publicar_media_admin(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=id_destino,
                 from_chat_id=ID_ADMIN,
                 message_id=update.message.message_id,
-                caption=caption_admin
+                caption=caption_admin if caption_admin else None  # None = conservar original (y no falla con stickers/video-notas)
             )
             thread_id = get_thread_msg_id(id_destino)
             confirmacion = f"✅ Tú → ({id_destino}) enviaste {tipo}"
@@ -417,7 +451,15 @@ async def publicar_media_admin(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(f"❌ Error enviando al lead: {e}")
         return
 
-    # Caso 2: publicación al grupo
+    # Caso 2: publicación al grupo (solo tipos publicables; un sticker/documento suelto
+    # casi seguro era para un lead — evitar publicarlo al grupo por accidente)
+    if tipo in ("Sticker", "Video-nota", "Documento"):
+        await update.message.reply_text(
+            f"⚠️ Recibí un {tipo} sin Reply. Para enviarlo a un lead, responde (Reply) a su mensaje.\n"
+            f"(Los {tipo.lower()}s no se publican al grupo.)"
+        )
+        return
+
     keyboard = [[InlineKeyboardButton("🔥 Escribeme al privado mor", url=f"https://t.me/{context.bot.username}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     try:
@@ -425,7 +467,7 @@ async def publicar_media_admin(update: Update, context: ContextTypes.DEFAULT_TYP
             chat_id=ID_TU_GRUPO,
             from_chat_id=ID_ADMIN,
             message_id=update.message.message_id,
-            caption=caption_admin,
+            caption=caption_admin if caption_admin else None,
             reply_markup=reply_markup
         )
         await update.message.reply_text(f"✅ {tipo} publicado/a en el grupo.")
@@ -567,7 +609,7 @@ async def ver_leads_activos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         texto = f"🔥 LEADS ACTIVOS ({len(leads)})\n{SEPARADOR}\n\n"
         for i, (nombre, uid, ultimo_msg) in enumerate(leads, 1):
             fecha = ultimo_msg if ultimo_msg else "Sin mensajes"
-            texto += f"{i}. 👤 {nombre} ({uid})\n   📅 {fecha}\n\n"
+            texto += f"{i}. 👤 {nombre} [{uid}]\n   📅 {fecha}\n\n"   # [id]: evita que un Reply a la lista se envíe al primer lead
 
         texto += SEPARADOR + "\n"
         texto += "💡 /abrir <id> → trae el hilo arriba\n"
@@ -603,10 +645,11 @@ async def cerrar_todos_leads(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await context.bot.send_message(chat_id=user_id, text="Cualquier cosa no dudes en avisarme mor. 👋")
             except Exception:
                 errores += 1
+            await asyncio.sleep(0.05)  # rate limit anti-flood
 
         resumen = f"✅ {len(leads)} lead(s) cerrado(s):\n\n"
         for user_id, nombre in leads:
-            resumen += f"• {nombre} ({user_id})\n"
+            resumen += f"• {nombre} [{user_id}]\n"
 
         if errores:
             resumen += f"\n⚠️ {errores} usuario(s) no pudieron ser notificados."
@@ -653,7 +696,7 @@ async def ver_estadisticas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for nombre, uid, modo, msg_count in usuarios_recientes:
             emoji = "🔥" if modo == "humano" else "💤"
-            stats += f"{emoji} {nombre} ({uid}): {msg_count} msgs\n"
+            stats += f"{emoji} {nombre} [{uid}]: {msg_count} msgs\n"
 
         await update.message.reply_text(stats)
 
@@ -675,14 +718,20 @@ async def seguimiento_leads_frios(context: ContextTypes.DEFAULT_TYPE):
 
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
+    # Solo mensajes reales (entrada_usuario / salida_humano): los avisos automáticos
+    # (auto_espera, auto_seguimiento) no cuentan para decidir si el lead está frío.
     c.execute("""
-        SELECT u.user_id, u.nombre, MAX(m.fecha) AS ultima,
-               (SELECT tipo FROM mensajes WHERE user_id=u.user_id ORDER BY fecha DESC LIMIT 1) AS ultimo_tipo
+        SELECT u.user_id, u.nombre,
+               MAX(m.fecha) AS ultima,
+               MAX(CASE WHEN m.tipo='entrada_usuario' THEN m.fecha END) AS last_in,
+               MAX(CASE WHEN m.tipo='salida_humano'  THEN m.fecha END) AS last_out
         FROM usuarios u
         JOIN mensajes m ON u.user_id = m.user_id
         WHERE u.modo='humano' AND COALESCE(u.seguimiento_enviado, 0) = 0
+          AND m.tipo IN ('entrada_usuario', 'salida_humano')
         GROUP BY u.user_id
-        HAVING ultima < ? AND ultimo_tipo = 'salida_humano'
+        HAVING ultima < ? AND last_out IS NOT NULL
+           AND (last_in IS NULL OR last_out >= last_in)
     """, (limite,))
     frios = c.fetchall()
     conn.close()
@@ -691,11 +740,11 @@ async def seguimiento_leads_frios(context: ContextTypes.DEFAULT_TYPE):
         return
 
     print(f"🔁 Seguimiento: {len(frios)} lead(s) frío(s) detectado(s).")
-    for user_id, nombre, ultima, ultimo_tipo in frios:
+    for user_id, nombre, ultima, last_in, last_out in frios:
         mensaje = random.choice(MENSAJES_SEGUIMIENTO).format(nombre=nombre or "mor")
         try:
             await context.bot.send_message(chat_id=user_id, text=mensaje)
-            guardar_mensaje(user_id, mensaje, "salida_humano")
+            guardar_mensaje(user_id, mensaje, "auto_seguimiento")
             marcar_seguimiento_enviado(user_id)
             thread_id = get_thread_msg_id(user_id)
             await context.bot.send_message(
@@ -739,6 +788,7 @@ async def enviar_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             enviados += 1
         except Exception:
             errores += 1
+        await asyncio.sleep(0.05)  # ~20 msg/s, bajo el límite de Telegram (evita 429/flood-ban)
 
     resumen = f"✅ Promo enviada a {enviados} lead(s)."
     if errores:
@@ -782,6 +832,9 @@ def _leads_esperando(minutos):
 async def avisar_espera_leads(context: ContextTypes.DEFAULT_TYPE):
     """Si un lead lleva MIN_ESPERA_LEAD min esperando tu respuesta, le manda un
     mensaje cálido (una sola vez por espera) para que no se enfríe ni se vaya."""
+    if not esta_en_horario_permitido():
+        return  # nada de "ya casi te contesto" a las 3am
+
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
     c.execute("SELECT user_id FROM usuarios WHERE COALESCE(espera_avisada,0)=1")
@@ -824,12 +877,119 @@ async def recordar_pendientes(context: ContextTypes.DEFAULT_TYPE):
             espera = f"{mins} min" if mins < 60 else f"{mins // 60}h {mins % 60}min"
         except Exception:
             espera = "?"
-        texto += f"• 👤 {nombre} ({user_id}) — hace {espera}\n"
+        texto += f"• 👤 {nombre} [{user_id}] — hace {espera}\n"   # [id] a propósito: un Reply a esta lista NO debe enviarse a nadie
     texto += f"\n{SEPARADOR}\n💡 /abrir <id> para traer su hilo arriba"
     try:
         await context.bot.send_message(chat_id=ID_ADMIN, text=texto)
     except Exception as e:
         print(f"⚠️ Error enviando recordatorio de pendientes: {e}")
+
+# ==============================================================================
+#  BIENVENIDA Y SALIDAS EN EL GRUPO
+# ==============================================================================
+
+async def bienvenida_nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Saluda al instante a quien se une al grupo, con gancho + botón al privado.
+    Engancha al nuevo en su momento de mayor curiosidad."""
+    msg = update.message
+    if not msg or not msg.new_chat_members or msg.chat.id != ID_TU_GRUPO:
+        return
+
+    nuevos = [u for u in msg.new_chat_members if not u.is_bot]
+    if not nuevos:
+        return
+
+    nombres = ", ".join(u.first_name for u in nuevos)
+    mensaje = random.choice(MENSAJES_BIENVENIDA).format(nombre=nombres)
+    keyboard = [[InlineKeyboardButton("💌 Escríbeme por privado", url=f"https://t.me/{context.bot.username}")]]
+
+    try:
+        await msg.reply_text(mensaje, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        print(f"⚠️ Error dando bienvenida: {e}")
+
+    # Aviso discreto al admin (métrica de crecimiento)
+    try:
+        detalle = ", ".join(f"{u.first_name} [{u.id}]" for u in nuevos)
+        await context.bot.send_message(chat_id=ID_ADMIN, text=f"📈 Se unió al grupo: {detalle}")
+    except Exception:
+        pass
+
+async def aviso_salida_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Notifica al admin cuando alguien abandona el grupo (métrica de fuga).
+    No publica nada en el grupo."""
+    msg = update.message
+    if not msg or not msg.left_chat_member or msg.chat.id != ID_TU_GRUPO:
+        return
+    u = msg.left_chat_member
+    if u.is_bot:
+        return
+    try:
+        await context.bot.send_message(chat_id=ID_ADMIN, text=f"📉 Se salió del grupo: {u.first_name} [{u.id}]")
+    except Exception:
+        pass
+
+# ==============================================================================
+#  RESPALDO DE LA BASE DE DATOS
+# ==============================================================================
+
+BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+BACKUPS_A_CONSERVAR = 7  # rotación local: se conservan los N más recientes
+
+def _crear_respaldo():
+    """Snapshot seguro de la DB (API de backup de SQLite: consistente aunque
+    el bot esté escribiendo). Devuelve la ruta del archivo creado."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    nombre = f"historial_chat_{datetime.now().strftime('%Y-%m-%d_%H%M')}.db"
+    destino = os.path.join(BACKUP_DIR, nombre)
+    src = sqlite3.connect('historial_chat.db')
+    dst = sqlite3.connect(destino)
+    with dst:
+        src.backup(dst)
+    dst.close()
+    src.close()
+    # Rotación: el nombre lleva la fecha, así que orden alfabético = cronológico
+    respaldos = sorted(f for f in os.listdir(BACKUP_DIR) if f.endswith(".db"))
+    for viejo in respaldos[:-BACKUPS_A_CONSERVAR]:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, viejo))
+        except OSError:
+            pass
+    return destino
+
+async def respaldo_db(context: ContextTypes.DEFAULT_TYPE):
+    """Crea el respaldo y te lo envía como documento al chat (copia fuera de la PC)."""
+    try:
+        ruta = _crear_respaldo()
+        conn = sqlite3.connect('historial_chat.db')
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM usuarios")
+        usuarios = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM mensajes")
+        mensajes = c.fetchone()[0]
+        conn.close()
+
+        with open(ruta, "rb") as f:
+            await context.bot.send_document(
+                chat_id=ID_ADMIN,
+                document=f,
+                filename=os.path.basename(ruta),
+                caption=f"💾 Respaldo de la base de datos\n👥 {usuarios} usuarios · 💬 {mensajes} mensajes"
+            )
+        print(f"💾 Respaldo creado y enviado: {os.path.basename(ruta)}")
+    except Exception as e:
+        print(f"❌ Error en el respaldo: {e}")
+        try:
+            await context.bot.send_message(chat_id=ID_ADMIN, text=f"❌ Falló el respaldo de la DB: {e}")
+        except Exception:
+            pass
+
+async def backup_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /backup: respaldo inmediato a demanda."""
+    if update.effective_user.id != ID_ADMIN:
+        return
+    await update.message.reply_text("📤 Generando respaldo...")
+    await respaldo_db(context)
 
 # --- MENÚ DE COMANDOS ---
 async def configurar_menu(app):
@@ -845,6 +1005,7 @@ async def configurar_menu(app):
         BotCommand("cerrar", "Cerrar ticket (responde al lead)"),
         BotCommand("cerrarid", "Cerrar ticket por <id>"),
         BotCommand("cerrartodos", "Cerrar todos los leads activos"),
+        BotCommand("backup", "Respaldar la base de datos ahora"),
     ]
     comandos_usuario = [
         BotCommand("start", "Iniciar conversación"),
@@ -871,10 +1032,19 @@ def main():
     app.add_handler(CommandHandler("leads", ver_leads_activos))
     app.add_handler(CommandHandler("stats", ver_estadisticas))
     app.add_handler(CommandHandler("historial", ver_historial_usuario))
+    app.add_handler(CommandHandler("backup", backup_manual))
+
+    # Grupo: bienvenida a nuevos miembros y aviso de salidas
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bienvenida_nuevo_miembro))
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, aviso_salida_miembro))
+
+    # Todos los tipos de media soportados (antes stickers/GIFs/video-notas/documentos se perdían)
+    FILTRO_MEDIA = (filters.PHOTO | filters.VIDEO | filters.VOICE | filters.AUDIO
+                    | filters.VIDEO_NOTE | filters.Sticker.ALL | filters.ANIMATION | filters.Document.ALL)
 
     # Admin: media (reply a lead = enviar; sin reply = publicar al grupo)
     app.add_handler(MessageHandler(
-        (filters.PHOTO | filters.VIDEO | filters.VOICE | filters.AUDIO) & filters.ChatType.PRIVATE & filters.User(ID_ADMIN),
+        FILTRO_MEDIA & filters.ChatType.PRIVATE & filters.User(ID_ADMIN),
         publicar_media_admin
     ))
     # Admin: texto (responder a lead)
@@ -888,17 +1058,19 @@ def main():
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.User(ID_ADMIN),
         manejar_mensaje_usuario
     ))
-    # Usuario: media (foto/video/voz/audio) → reenvía al hilo del admin
+    # Usuario: media (foto/video/voz/audio/sticker/GIF/video-nota/documento) → reenvía al hilo del admin
     app.add_handler(MessageHandler(
-        (filters.PHOTO | filters.VIDEO | filters.VOICE | filters.AUDIO) & filters.ChatType.PRIVATE & ~filters.User(ID_ADMIN),
+        FILTRO_MEDIA & filters.ChatType.PRIVATE & ~filters.User(ID_ADMIN),
         usuario_envia_media
     ))
 
     job_queue = app.job_queue
-    job_queue.run_repeating(generar_post_automatico, interval=21600, first=30)
+    job_queue.run_repeating(generar_post_automatico, interval=21600, first=1800)  # primer post 30 min después de arrancar (evita spam en cada reinicio)
     job_queue.run_repeating(seguimiento_leads_frios, interval=3600, first=60)
     job_queue.run_repeating(avisar_espera_leads, interval=300, first=90)
     job_queue.run_repeating(recordar_pendientes, interval=1800, first=120)
+    # Respaldo diario de la DB a las 10:00 (hora local) → te llega como documento al chat
+    job_queue.run_daily(respaldo_db, time=dt_time(10, 0, tzinfo=pytz.timezone(TIMEZONE)))
 
     print("🤖 Bot Paisa 4.0 Iniciado (MODO PRIVADO DIRECTO)")
     print(f"⏰ Horario de publicaciones: {HORA_INICIO_POST} - {HORA_FIN_POST} ({TIMEZONE})")
