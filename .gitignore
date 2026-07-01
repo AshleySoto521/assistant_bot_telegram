@@ -1,3 +1,11 @@
+# Entorno / secretos
 .env
-null
+
+# Base de datos con datos de clientes (NUNCA subir)
 historial_chat.db
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.pyc
