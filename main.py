@@ -68,6 +68,16 @@ MENSAJES_SEGUIMIENTO = [
     "Ando por aquí {nombre}, por si te animas a retomar 😌",
 ]
 
+# --- CONTROL DE LEADS ESPERANDO RESPUESTA ---
+MIN_ESPERA_LEAD = 20        # min sin respuesta del admin antes de mandarle un "ya casi te atiendo" al lead
+MIN_PENDIENTE_ADMIN = 15    # min que un lead lleva esperando para contar como pendiente en el recordatorio al admin
+MENSAJES_ESPERA = [
+    "Uy perdón {nombre} bebé, ando a mil pero ya te vi 🙈 dame un ratico y te atiendo 💕",
+    "No te me desaparezcas mor, ya casi te contesto 😘",
+    "Ando ocupadita pero no te he olvidado eh 👀 aguántame tantito 🔥",
+    "Ya te leí {nombre}, dame un momentico y soy toda tuya 😏",
+]
+
 # --- BASE DE DATOS LOCAL ---
 def iniciar_db():
     conn = sqlite3.connect('historial_chat.db')
@@ -80,6 +90,10 @@ def iniciar_db():
         pass
     try:
         c.execute("ALTER TABLE usuarios ADD COLUMN seguimiento_enviado INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE usuarios ADD COLUMN espera_avisada INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -120,6 +134,20 @@ def resetear_seguimiento(user_id):
     conn = sqlite3.connect('historial_chat.db')
     c = conn.cursor()
     c.execute("UPDATE usuarios SET seguimiento_enviado=0 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def marcar_espera_avisada(user_id):
+    conn = sqlite3.connect('historial_chat.db')
+    c = conn.cursor()
+    c.execute("UPDATE usuarios SET espera_avisada=1 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def resetear_espera(user_id):
+    conn = sqlite3.connect('historial_chat.db')
+    c = conn.cursor()
+    c.execute("UPDATE usuarios SET espera_avisada=0 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -352,6 +380,7 @@ async def admin_responde_texto(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_to_message_id=thread_id
         )
         guardar_mensaje(id_usuario_destino, update.message.text, "salida_humano")
+        resetear_espera(id_usuario_destino)
     except Exception as e:
         await update.message.reply_text(f"❌ Error al enviar: {e}")
 
@@ -383,6 +412,7 @@ async def publicar_media_admin(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_to_message_id=thread_id
             )
             guardar_mensaje(id_destino, f"[{tipo.upper()}]" + (f" {caption_admin}" if caption_admin else ""), "salida_humano")
+            resetear_espera(id_destino)
         except Exception as e:
             await update.message.reply_text(f"❌ Error enviando al lead: {e}")
         return
@@ -715,6 +745,92 @@ async def enviar_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resumen += f"\n⚠️ {errores} no la recibieron (bloquearon el bot o nunca lo iniciaron)."
     await update.message.reply_text(resumen)
 
+# ==============================================================================
+#  LEADS ESPERANDO RESPUESTA (anti-fuga)
+# ==============================================================================
+
+def _leads_esperando(minutos):
+    """Devuelve [(user_id, nombre, last_in)] de leads activos cuyo último mensaje
+    fue del usuario (aún sin responder por el admin) hace más de `minutos`.
+    Solo considera respuestas humanas reales (no los avisos automáticos)."""
+    limite = (datetime.now() - timedelta(minutes=minutos)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect('historial_chat.db')
+    c = conn.cursor()
+    c.execute("""
+        SELECT u.user_id, u.nombre,
+               MAX(CASE WHEN m.tipo='entrada_usuario' THEN m.fecha END) AS last_in,
+               MAX(CASE WHEN m.tipo='salida_humano'  THEN m.fecha END) AS last_out
+        FROM usuarios u
+        JOIN mensajes m ON u.user_id = m.user_id
+        WHERE u.modo='humano'
+        GROUP BY u.user_id
+    """)
+    filas = c.fetchall()
+    conn.close()
+
+    esperando = []
+    for user_id, nombre, last_in, last_out in filas:
+        if not last_in:
+            continue
+        if last_out and last_out >= last_in:   # el admin ya respondió después del último mensaje
+            continue
+        if last_in >= limite:                  # aún no cumple los minutos de espera
+            continue
+        esperando.append((user_id, nombre or "Usuario", last_in))
+    return esperando
+
+async def avisar_espera_leads(context: ContextTypes.DEFAULT_TYPE):
+    """Si un lead lleva MIN_ESPERA_LEAD min esperando tu respuesta, le manda un
+    mensaje cálido (una sola vez por espera) para que no se enfríe ni se vaya."""
+    conn = sqlite3.connect('historial_chat.db')
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM usuarios WHERE COALESCE(espera_avisada,0)=1")
+    ya_avisados = {row[0] for row in c.fetchall()}
+    conn.close()
+
+    for user_id, nombre, last_in in _leads_esperando(MIN_ESPERA_LEAD):
+        if user_id in ya_avisados:
+            continue
+        mensaje = random.choice(MENSAJES_ESPERA).format(nombre=nombre)
+        try:
+            await context.bot.send_message(chat_id=user_id, text=mensaje)
+            guardar_mensaje(user_id, mensaje, "auto_espera")
+            marcar_espera_avisada(user_id)
+            thread_id = get_thread_msg_id(user_id)
+            await context.bot.send_message(
+                chat_id=ID_ADMIN,
+                text=f"⏳ Aviso de espera enviado a {nombre} ({user_id}) — sigue pendiente de tu respuesta.",
+                reply_to_message_id=thread_id
+            )
+        except Exception as e:
+            print(f"⚠️ Error avisando espera a {user_id}: {e}")
+
+async def recordar_pendientes(context: ContextTypes.DEFAULT_TYPE):
+    """Le recuerda al admin qué leads llevan esperando respuesta (cola de pendientes)."""
+    if not esta_en_horario_permitido():
+        return
+
+    pendientes = _leads_esperando(MIN_PENDIENTE_ADMIN)
+    if not pendientes:
+        return
+
+    pendientes.sort(key=lambda x: x[2])  # el que lleva más esperando, primero
+    ahora = datetime.now()
+    texto = f"⏳ TIENES {len(pendientes)} LEAD(S) ESPERANDO RESPUESTA\n{SEPARADOR}\n\n"
+    for user_id, nombre, last_in in pendientes:
+        try:
+            transcurrido = ahora - datetime.strptime(last_in, "%Y-%m-%d %H:%M:%S")
+            mins = int(transcurrido.total_seconds() // 60)
+            espera = f"{mins} min" if mins < 60 else f"{mins // 60}h {mins % 60}min"
+        except Exception:
+            espera = "?"
+        texto += f"• 👤 {nombre} ({user_id}) — hace {espera}\n"
+    texto += f"\n{SEPARADOR}\n💡 /abrir <id> para traer su hilo arriba"
+    try:
+        await context.bot.send_message(chat_id=ID_ADMIN, text=texto)
+    except Exception as e:
+        print(f"⚠️ Error enviando recordatorio de pendientes: {e}")
+
 # --- MENÚ DE COMANDOS ---
 async def configurar_menu(app):
     """Configura el menú '/' del bot: comandos completos para el admin,
@@ -781,6 +897,8 @@ def main():
     job_queue = app.job_queue
     job_queue.run_repeating(generar_post_automatico, interval=21600, first=30)
     job_queue.run_repeating(seguimiento_leads_frios, interval=3600, first=60)
+    job_queue.run_repeating(avisar_espera_leads, interval=300, first=90)
+    job_queue.run_repeating(recordar_pendientes, interval=1800, first=120)
 
     print("🤖 Bot Paisa 4.0 Iniciado (MODO PRIVADO DIRECTO)")
     print(f"⏰ Horario de publicaciones: {HORA_INICIO_POST} - {HORA_FIN_POST} ({TIMEZONE})")
